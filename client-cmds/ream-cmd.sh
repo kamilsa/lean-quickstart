@@ -1,7 +1,12 @@
 #!/bin/bash
 
 #-----------------------ream setup----------------------
-node_binary=
+node_binary="/Users/taisei/dev/ream/target/debug/ream lean_node \
+        --network $configDir/config.yaml \
+        --validator-registry-path $configDir/validators.yaml \
+        --bootnodes $configDir/nodes.yaml \
+        --node-id $item --node-key $configDir/$privKeyPath \
+        --socket-port $quicPort"
 node_docker="ghcr.io/reamlabs/ream:latest --data-dir /data \
         lean_node \
         --network /config/config.yaml \
@@ -11,4 +16,4 @@ node_docker="ghcr.io/reamlabs/ream:latest --data-dir /data \
         --socket-port $quicPort"
 
 # choose either binary or docker
-node_setup="docker"
+node_setup="binary"

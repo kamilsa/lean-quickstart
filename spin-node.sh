@@ -24,7 +24,7 @@ else
 fi
 
 if [ -f "$validator_config_file" ]; then
-    nodes=($(grep -A 1 "^\s*-\s*name:" "$validator_config_file" | grep "name:" | sed 's/.*name:\s*"\(.*\)".*/\1/'))
+    nodes=($(grep "name:" "$validator_config_file" | sed 's/.*name:[[:space:]]*"\([^"]*\)".*/\1/'))
 else
     echo "Error: Validator config file not found at $validator_config_file"
     nodes=()
@@ -48,7 +48,15 @@ fi;
 
 # 3. run clients
 mkdir -p $dataDir
-popupTerminalCmd="gnome-terminal --disable-factory --"
+# Detect OS and set terminal command
+if [[ "$OSTYPE" == "darwin"* ]]; then
+  # macOS - we'll handle the command differently in the execution block
+  popupTerminalCmd=""
+else
+  # Linux
+  popupTerminalCmd="gnome-terminal --disable-factory --"
+fi
+
 for item in "${spin_nodes[@]}"; do
   # create and/or cleanup datadirs
   itemDataDir="$dataDir/$item"
@@ -93,7 +101,14 @@ for item in "${spin_nodes[@]}"; do
 
   if [ -n "$popupTerminal" ]
   then
-    execCmd="$popupTerminalCmd $execCmd"
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+      # macOS - escape the command for AppleScript
+      escapedCmd=$(echo "$execCmd" | sed 's/\\/\\\\/g' | sed 's/"/\\"/g')
+      execCmd="osascript -e 'tell application \"Terminal\" to do script \"$escapedCmd\"'"
+    else
+      # Linux
+      execCmd="$popupTerminalCmd $execCmd"
+    fi
   fi;
 
   echo "$execCmd"
