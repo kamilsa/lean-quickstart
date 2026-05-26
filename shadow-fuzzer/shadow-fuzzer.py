@@ -733,6 +733,7 @@ def main() -> None:
             print("  [dry-run] Writing metadata-only stats.json")
             dry_stats = {
                 "blocks": {"slots": [], "summary": {"warning": "dry-run: no simulation data"}},
+                "chain_status": {"slots": [], "summary": {"warning": "dry-run: no simulation data"}},
                 "attestations": {
                     "slots": [],
                     "summary": {"warning": "dry-run: no simulation data"},

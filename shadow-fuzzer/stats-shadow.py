@@ -21,7 +21,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
-ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 SHADOW_TS_RE = re.compile(
     r"\d+\.\d+\.\d+\s+(\d+):(\d+):(\d+)\.(\d+)"
 )
@@ -208,6 +208,72 @@ def _parse_zeam_publish_attestation(line: str) -> dict[str, Any] | None:
     }
 
 
+def _parse_chain_status_line(line: str, status: dict[str, Any]) -> bool:
+    clean = ANSI_RE.sub("", line)
+
+    m = re.search(r"Current Slot:\s*(-?\d+).*Head Slot:\s*(\d+)", clean)
+    if m:
+        status["slot"] = int(m.group(1))
+        status["head_slot"] = int(m.group(2))
+        return False
+
+    m = re.search(r"Head Block Root:\s*0x([0-9a-fA-F]+)", clean)
+    if m:
+        status["head_root"] = m.group(1).lower()
+        return False
+
+    m = re.search(
+        r"Latest Justified:\s*Slot\s*(\d+)\s*\|\s*Root:\s*0x([0-9a-fA-F]+)",
+        clean,
+    )
+    if not m:
+        m = re.search(
+            r"Latest Justified:\s*0x([0-9a-fA-F]+)\s*@\s*(\d+)", clean
+        )
+        if m:
+            status["latest_justified_root"] = m.group(1).lower()
+            status["latest_justified_slot"] = int(m.group(2))
+            return False
+    if m:
+        status["latest_justified_slot"] = int(m.group(1))
+        status["latest_justified_root"] = m.group(2).lower()
+        return False
+
+    m = re.search(
+        r"Latest Finalized:\s*Slot\s*(\d+)\s*\|\s*Root:\s*0x([0-9a-fA-F]+)",
+        clean,
+    )
+    if not m:
+        m = re.search(
+            r"Latest Finalized:\s*0x([0-9a-fA-F]+)\s*@\s*(\d+)", clean
+        )
+        if m:
+            status["latest_finalized_root"] = m.group(1).lower()
+            status["latest_finalized_slot"] = int(m.group(2))
+            return True
+    if m:
+        status["latest_finalized_slot"] = int(m.group(1))
+        status["latest_finalized_root"] = m.group(2).lower()
+        return True
+
+    return False
+
+
+def _chain_status_complete(status: dict[str, Any]) -> bool:
+    return all(
+        k in status
+        for k in (
+            "slot",
+            "head_slot",
+            "head_root",
+            "latest_justified_slot",
+            "latest_justified_root",
+            "latest_finalized_slot",
+            "latest_finalized_root",
+        )
+    )
+
+
 def _read_host_events(
     hosts_dir: Path,
 ) -> dict[str, dict[str, list[dict[str, Any]]]]:
@@ -235,12 +301,26 @@ def _read_host_events(
         "receive_block": defaultdict(list),
         "publish_block": defaultdict(list),
         "publish_attestation": defaultdict(list),
+        "chain_status": defaultdict(list),
     }
 
     for host_dir in sorted(hosts_dir.iterdir()):
         if not host_dir.is_dir():
             continue
+        pending_chain_status: dict[str, Any] | None = None
+        last_ts_ms = 0.0
         for host_name, line in _host_file_lines(host_dir.name):
+            parsed_ts_ms = parse_shadow_timestamp(line) * 1000
+            if parsed_ts_ms > 0:
+                last_ts_ms = parsed_ts_ms
+
+            if pending_chain_status is not None:
+                done = _parse_chain_status_line(line, pending_chain_status)
+                if done and _chain_status_complete(pending_chain_status):
+                    if pending_chain_status["slot"] >= 0:
+                        _append("chain_status", host_name, pending_chain_status)
+                    pending_chain_status = None
+
             if "LEAN-INTEROP-TEST" in line:
                 if "RECEIVE-ATTESTATION" in line:
                     e = _parse_interop_attestation(line)
@@ -255,7 +335,13 @@ def _read_host_events(
                     if e:
                         _append("publish_attestation", host_name, e)
             else:
-                if "received gossip attestation for slot=" in line:
+                if "CHAIN STATUS" in line:
+                    pending_chain_status = {
+                        "ts_ms": round(parsed_ts_ms or last_ts_ms, 1),
+                        "source": "qlean_text" if host_name.startswith("qlean-") else "zeam_text",
+                    }
+                    _parse_chain_status_line(line, pending_chain_status)
+                elif "received gossip attestation for slot=" in line:
                     e = _parse_zeam_receive_attestation(line)
                     if e:
                         _append("receive_attestation", host_name, e)
@@ -557,6 +643,47 @@ def _compute_block_slot_stats(
     return {"slots": slot_list, "summary": summary}
 
 
+def _compute_chain_status_stats(
+    events: dict[str, dict[str, list[dict[str, Any]]]],
+    genesis_ms: int,
+) -> dict[str, Any]:
+    cs = events["chain_status"]
+    by_slot: dict[int, dict[str, dict[str, Any]]] = defaultdict(dict)
+
+    for host_name, host_events in cs.items():
+        for evt in host_events:
+            slot = int(evt["slot"])
+            ts_ms = _event_ts_ms(evt)
+            host_status = {
+                "head_slot": int(evt["head_slot"]),
+                "head_root": evt["head_root"],
+                "latest_justified_slot": int(evt["latest_justified_slot"]),
+                "latest_justified_root": evt["latest_justified_root"],
+                "latest_finalized_slot": int(evt["latest_finalized_slot"]),
+                "latest_finalized_root": evt["latest_finalized_root"],
+                "ts_ms": round(ts_ms - genesis_ms, 1),
+                "source": evt.get("source", "unknown"),
+            }
+            previous = by_slot[slot].get(host_name)
+            if previous is None or host_status["ts_ms"] >= previous["ts_ms"]:
+                by_slot[slot][host_name] = host_status
+
+    slot_list = [
+        {"slot": slot, "hosts": dict(sorted(hosts.items()))}
+        for slot, hosts in sorted(by_slot.items())
+    ]
+    hosts_with_data = sorted({host for hosts in by_slot.values() for host in hosts})
+
+    summary: dict[str, Any] = {
+        "slots_with_data": len(slot_list),
+        "hosts_with_data": len(hosts_with_data),
+    }
+    if not slot_list:
+        summary["warning"] = "No chain status events found"
+
+    return {"slots": slot_list, "summary": summary}
+
+
 def _load_json(path: Path) -> dict[str, Any]:
     if path.is_file():
         return json.loads(path.read_text())
@@ -613,6 +740,7 @@ def collect_stats(run_dir: str, metadata: dict[str, Any] | None = None) -> dict[
                 "clients": metadata.get("node_counts", {}),
             },
             "blocks": {"slots": [], "summary": {"warning": warnings[0]}},
+            "chain_status": {"slots": [], "summary": {"warning": warnings[0]}},
             "attestations": {
                 "slots": [],
                 "summary": {"warning": warnings[0]},
@@ -660,6 +788,7 @@ def collect_stats(run_dir: str, metadata: dict[str, Any] | None = None) -> dict[
         events, host_names
     )
     block_stats = _compute_block_slot_stats(events, int(genesis_ms))
+    chain_status_stats = _compute_chain_status_stats(events, int(genesis_ms))
 
     region_counts: dict[str, int] = {}
     for r in regions.values():
@@ -673,6 +802,7 @@ def collect_stats(run_dir: str, metadata: dict[str, Any] | None = None) -> dict[
 
     result: dict[str, Any] = {
         "blocks": block_stats,
+        "chain_status": chain_status_stats,
         "attestations": attestation_stats,
         "event_counts": _summarize_event_counts(events),
         "node_distribution": {
