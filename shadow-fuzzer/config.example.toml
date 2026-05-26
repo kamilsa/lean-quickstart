@@ -3,15 +3,30 @@
 # Ranges are resolved per-run using `seed + run_index`.
 
 [fuzzer]
-max_runs = 20                                                              # Total number of simulation runs in the sweep.
+max_runs = 2                                                              # Total number of simulation runs in the sweep.
 duration_secs = { min = 120, max = 120 }                                   # Duration of a single Shadow simulation in seconds (range or scalar).
 seed = 42                                                                  # Base seed — per-run seed is `seed + run_index` for reproducibility.
 output_dir = "fuzzer-output"                                               # Directory where per-run output folders are placed.
 runner = "docker-arm"                                                           # Shadow runner: "local" (host shadow binary) or "docker-arm".
 base_genesis_dir = "shadow-devnet/genesis"                                 # Genesis template directory (each run gets its own copy).
 
+[docker_arm]
+shadow_image = "kamilsa/shadow-arm:latest"                                  # Base ARM image that contains the Shadow simulator.
+image_name = "lean-shadow-fuzzer:local"                                      # Composite image built from Shadow plus configured client images.
+rebuild = true                                                               # Rebuild the composite image before running the sweep.
+
+[client_images.zeam]
+image = "blockblaz/zeam:devnet4"                                             # Source Docker image used for zeam when runner = "docker-arm".
+executable = "zeam"                                                          # Command to resolve via PATH inside image if executable_path_in_image is omitted.
+# executable_path_in_image = "/usr/local/bin/zeam"                            # Optional explicit executable path inside the source image.
+
+[client_images.qlean]
+image = "qdrvm/qlean-mini:devnet-4-arm64"                                    # Source Docker image used for qlean when runner = "docker-arm".
+executable = "qlean"                                                         # Command to resolve via PATH inside image if executable_path_in_image is omitted.
+# executable_path_in_image = "/usr/local/bin/qlean"                           # Optional explicit executable path inside the source image.
+
 [simulation]
-total_nodes = { min = 16, max = 64 }                                      # Total number of validator nodes in the network.
+total_nodes = { min = 8, max = 9 }                                      # Total number of validator nodes in the network.
 total_subnets = { min = 1, max = 1 }                                       # Number of attestation subnets (attestation_committee_count).
 aggregators_per_subnet = { min = 1, max = 2 }                              # How many aggregator nodes to select per subnet.
 signatures_aggregation_rate = { min = 1000, max = 1000 }                   # qlean fake XMSS aggregate-signatures rate (sig/s). Placeholder for zeam.

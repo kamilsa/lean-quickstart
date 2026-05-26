@@ -16,6 +16,7 @@ import json
 import os
 import random
 import secrets
+import shlex
 import shutil
 import subprocess
 import sys
@@ -48,6 +49,8 @@ DEFAULT_BANDWIDTH_WEIGHTS = {
     "100 Mbit": 0.20,
     "50 Mbit": 0.75,
 }
+
+DOCKER_ARM_CLIENT_ROOT = "/opt/shadow-fuzzer/clients"
 
 
 def _resolve_value(raw: Any, rng: random.Random) -> Any:
@@ -83,6 +86,149 @@ def _sample_clients(
     for c in sampled:
         counts[c] = counts.get(c, 0) + 1
     return sampled, counts
+
+
+def _docker_stage_name(client: str) -> str:
+    safe = "".join(c if c.isalnum() else "_" for c in client.lower())
+    return f"client_{safe}"
+
+
+def _docker_client_executable_path(client: str, executable: str) -> str:
+    executable_name = Path(executable).name
+    return f"{DOCKER_ARM_CLIENT_ROOT}/{client}/{executable_name}"
+
+
+def _resolve_image_executable_path(image: str, executable: str) -> str:
+    subprocess.run(
+        ["docker", "pull", "--platform", "linux/arm64", image],
+        check=True,
+    )
+
+    inspect = subprocess.run(
+        ["docker", "image", "inspect", image],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    image_info = json.loads(inspect.stdout)[0]
+    entrypoint = image_info.get("Config", {}).get("Entrypoint") or []
+    if entrypoint:
+        first = entrypoint[0]
+        if first.startswith("/") and Path(first).name == Path(executable).name:
+            return first
+
+    result = subprocess.run(
+        [
+            "docker",
+            "run",
+            "--rm",
+            "--platform",
+            "linux/arm64",
+            "--entrypoint",
+            "/bin/sh",
+            image,
+            "-lc",
+            f"command -v {shlex.quote(executable)}",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        raise RuntimeError(
+            f"failed to resolve executable '{executable}' in image '{image}'. "
+            "Set executable_path_in_image explicitly in config."
+        )
+    return result.stdout.strip().splitlines()[-1]
+
+
+def _prepare_docker_arm_runtime(
+    template: dict[str, Any], output_dir: Path, dry_run: bool
+) -> dict[str, Any] | None:
+    runner = template["fuzzer"].get("runner", "local")
+    if runner != "docker-arm":
+        return None
+
+    docker_arm_raw = template.get("docker_arm", {})
+    client_images_raw = template.get("client_images", {})
+    clients = template.get("clients", {})
+
+    docker_arm = {
+        "shadow_image": docker_arm_raw.get("shadow_image", "kamilsa/shadow-arm:latest"),
+        "image_name": docker_arm_raw.get("image_name", "lean-shadow-fuzzer:local"),
+        "rebuild": bool(docker_arm_raw.get("rebuild", True)),
+    }
+
+    client_images: dict[str, dict[str, Any]] = {}
+    client_runtime: dict[str, dict[str, str]] = {}
+    for client in clients:
+        raw = client_images_raw.get(client, {})
+        executable = str(raw.get("executable", client))
+        source_path = raw.get("executable_path_in_image")
+        if source_path is None and not dry_run and docker_arm["rebuild"]:
+            source_path = _resolve_image_executable_path(raw["image"], executable)
+
+        dest_path = _docker_client_executable_path(client, executable)
+        client_images[client] = {
+            "image": raw["image"],
+            "executable": executable,
+            "executable_path_in_image": source_path,
+            "runtime_path": dest_path,
+        }
+        client_runtime[client] = {"path": dest_path}
+
+    if not dry_run and docker_arm["rebuild"]:
+        _build_docker_arm_image(output_dir, docker_arm, client_images)
+    elif dry_run:
+        print("[dry-run] Skipping Docker ARM composite image build")
+
+    return {
+        "docker_arm": docker_arm,
+        "client_images": client_images,
+        "client_runtime": client_runtime,
+    }
+
+
+def _build_docker_arm_image(
+    output_dir: Path,
+    docker_arm: dict[str, Any],
+    client_images: dict[str, dict[str, Any]],
+) -> None:
+    build_dir = output_dir / "_docker-build"
+    build_dir.mkdir(parents=True, exist_ok=True)
+    dockerfile = build_dir / "Dockerfile"
+
+    lines = [f"FROM --platform=linux/arm64 {docker_arm['shadow_image']} AS shadow_base"]
+    for client, cfg in client_images.items():
+        lines.append(f"FROM --platform=linux/arm64 {cfg['image']} AS {_docker_stage_name(client)}")
+
+    lines.append("FROM shadow_base")
+    for client, cfg in client_images.items():
+        source_path = cfg.get("executable_path_in_image")
+        if not source_path:
+            raise RuntimeError(f"client '{client}' has no resolved executable_path_in_image")
+        if " " in source_path or " " in cfg["runtime_path"]:
+            raise RuntimeError(f"client '{client}' executable paths must not contain spaces")
+        dest_dir = str(Path(cfg["runtime_path"]).parent)
+        lines.append(f"RUN mkdir -p {dest_dir}")
+        lines.append(
+            f"COPY --from={_docker_stage_name(client)} {source_path} {cfg['runtime_path']}"
+        )
+        lines.append(f"RUN chmod +x {cfg['runtime_path']}")
+
+    dockerfile.write_text("\n".join(lines) + "\n")
+    subprocess.run(
+        [
+            "docker",
+            "build",
+            "--platform",
+            "linux/arm64",
+            "-t",
+            docker_arm["image_name"],
+            str(build_dir),
+        ],
+        check=True,
+    )
 
 
 def _generate_privkey(rng: random.Random) -> str:
@@ -248,6 +394,35 @@ def _validate_template(template: dict[str, Any]) -> list[str]:
     if not clients:
         errors.append("[clients] section missing or empty")
 
+    if runner == "docker-arm":
+        docker_arm = template.get("docker_arm", {})
+        if not isinstance(docker_arm, dict):
+            errors.append("[docker_arm] section missing or not a table")
+        else:
+            if not docker_arm.get("shadow_image"):
+                errors.append("[docker_arm].shadow_image is required for docker-arm runner")
+            if not docker_arm.get("image_name"):
+                errors.append("[docker_arm].image_name is required for docker-arm runner")
+
+        client_images = template.get("client_images", {})
+        if not isinstance(client_images, dict):
+            errors.append("[client_images] section missing or not a table")
+        else:
+            for client_name in clients:
+                image_cfg = client_images.get(client_name)
+                if not isinstance(image_cfg, dict):
+                    errors.append(
+                        f"[client_images.{client_name}] is required for docker-arm runner"
+                    )
+                    continue
+                if not image_cfg.get("image"):
+                    errors.append(f"[client_images.{client_name}].image is required")
+                explicit_path = image_cfg.get("executable_path_in_image")
+                if explicit_path is not None and not str(explicit_path).startswith("/"):
+                    errors.append(
+                        f"[client_images.{client_name}].executable_path_in_image must be absolute"
+                    )
+
     SCRIPT_DIR = REPO_ROOT
     for client_name in clients:
         cmd = SCRIPT_DIR / "client-cmds" / f"{client_name}-cmd.sh"
@@ -312,6 +487,7 @@ def _run_shadow_yaml(run_dir: Path, resolved: dict[str, Any]) -> None:
     shadow_yaml = run_dir / "shadow.yaml"
     topology_gml = run_dir / "topology.gml"
     bandwidths_json = run_dir / "bandwidths.json"
+    client_runtime_json = run_dir / "client-runtime.json"
 
     cmd: list[str] = [
         "bash",
@@ -337,6 +513,9 @@ def _run_shadow_yaml(run_dir: Path, resolved: dict[str, Any]) -> None:
             str(bandwidths_json),
         ]
 
+    if client_runtime_json.is_file():
+        cmd += ["--client-runtime-json", str(client_runtime_json)]
+
     subprocess.run(cmd, check=True)
 
 
@@ -361,6 +540,9 @@ def _run_shadow(run_dir: Path, resolved: dict[str, Any], dry_run: bool = False) 
         )
     elif runner == "docker-arm":
         project_root = REPO_ROOT.parent.resolve()
+        docker_image = resolved.get("docker_arm", {}).get(
+            "image_name", "kamilsa/shadow-arm:latest"
+        )
         subprocess.run(
             [
                 "docker", "run", "--rm",
@@ -372,7 +554,7 @@ def _run_shadow(run_dir: Path, resolved: dict[str, Any], dry_run: bool = False) 
                 "-v", f"{run_dir}:{run_dir}",
                 "-w", str(project_root),
                 "--entrypoint", "/bin/bash",
-                "kamilsa/shadow-arm:latest",
+                docker_image,
                 "-c", f"shadow -d {shadow_data} {shadow_yaml}",
             ],
             check=True,
@@ -466,10 +648,18 @@ def main() -> None:
     print(f"Config: {config_path_abs}")
     print()
 
+    docker_runtime = None
+    if fuzzer.get("runner") == "docker-arm":
+        print("Preparing Docker ARM runtime...")
+        docker_runtime = _prepare_docker_arm_runtime(template, output_dir, dry_run)
+        print()
+
     for run_index in range(int(max_runs)):
         print(f"--- Run {run_index + 1}/{max_runs} ---")
 
         resolved = _resolve_config(template, run_index)
+        if docker_runtime:
+            resolved.update(docker_runtime)
         warnings = _validate_resolved(resolved)
         for w in warnings:
             print(f"  WARNING: {w}")
@@ -508,9 +698,17 @@ def main() -> None:
             "clients": resolved.get("clients", {}),
             "node_counts": resolved.get("node_counts", {}),
         }
+        for key in ("docker_arm", "client_images", "client_runtime"):
+            if key in resolved:
+                metadata[key] = resolved[key]
         metadata_path = run_dir / "run-metadata.json"
         metadata_path.write_text(json.dumps(metadata, indent=2))
         print(f"  Wrote {metadata_path}")
+
+        if "client_runtime" in resolved:
+            client_runtime_path = run_dir / "client-runtime.json"
+            client_runtime_path.write_text(json.dumps(resolved["client_runtime"], indent=2))
+            print(f"  Wrote {client_runtime_path}")
 
         generate_genesis = not dry_run
 
@@ -521,9 +719,8 @@ def main() -> None:
         print("  Generating topology...")
         _run_topology(run_dir, {**resolved, "_internal": internal})
 
-        if generate_genesis:
-            print("  Generating shadow.yaml...")
-            _run_shadow_yaml(run_dir, {**resolved, "_internal": internal})
+        print("  Generating shadow.yaml...")
+        _run_shadow_yaml(run_dir, {**resolved, "_internal": internal})
 
         print("  Running Shadow...")
         _run_shadow(run_dir, {**resolved, "_internal": internal}, dry_run=dry_run)

@@ -383,7 +383,10 @@ def collect_stats(run_dir: str, metadata: dict[str, Any] | None = None) -> dict[
             "attestations": {"slots": [], "summary": {"warning": warnings[0]}},
             "warnings": warnings,
         }
-        for key in ("run_id", "run_index", "fuzzer", "simulation", "clients", "node_counts"):
+        for key in (
+            "run_id", "run_index", "fuzzer", "simulation", "clients", "node_counts",
+            "docker_arm", "client_images", "client_runtime",
+        ):
             if key in metadata:
                 result[key] = metadata[key]
         return result
@@ -432,7 +435,10 @@ def collect_stats(run_dir: str, metadata: dict[str, Any] | None = None) -> dict[
         "warnings": warnings,
     }
 
-    for key in ("run_id", "run_index", "fuzzer", "simulation", "clients", "node_counts"):
+    for key in (
+        "run_id", "run_index", "fuzzer", "simulation", "clients", "node_counts",
+        "docker_arm", "client_images", "client_runtime",
+    ):
         if key in metadata:
             result[key] = metadata[key]
 

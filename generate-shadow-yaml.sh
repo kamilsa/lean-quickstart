@@ -9,6 +9,7 @@ set -e
 # Usage:
 #   ./generate-shadow-yaml.sh <genesis-dir> --project-root <path> [--stop-time 360s] [--output shadow.yaml]
 #       [--seed <int>] [--shadow-data-dir <path>] [--topology-gml <path>] [--bandwidths-json <path>]
+#       [--client-runtime-json <path>]
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
@@ -16,6 +17,7 @@ show_usage() {
     cat << EOF
 Usage: $0 <genesis-dir> --project-root <path> [--stop-time 360s] [--output shadow.yaml]
        [--seed <int>] [--shadow-data-dir <path>] [--topology-gml <path>] [--bandwidths-json <path>]
+       [--client-runtime-json <path>]
 
 Generate a Shadow network simulator configuration (shadow.yaml) from validator-config.yaml.
 
@@ -30,6 +32,7 @@ Options:
   --shadow-data-dir <path> Shadow data output directory (default: <project-root>/shadow.data)
   --topology-gml <path>    GML topology file; enables geo-latency graph mode
   --bandwidths-json <path> JSON file mapping node_N → bandwidth tier
+  --client-runtime-json <path> JSON file mapping client names to Shadow process paths
 
 This script is client-agnostic. It reads node names from validator-config.yaml,
 extracts the client name from the node prefix (e.g., zeam_0 → zeam), and sources
@@ -55,6 +58,7 @@ SEED=""
 SHADOW_DATA_DIR=""
 TOPOLOGY_GML=""
 BANDWIDTHS_JSON=""
+CLIENT_RUNTIME_JSON=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -122,6 +126,15 @@ while [[ $# -gt 0 ]]; do
                 exit 1
             fi
             ;;
+        --client-runtime-json)
+            if [ -n "$2" ] && [ "${2:0:1}" != "-" ]; then
+                CLIENT_RUNTIME_JSON="$2"
+                shift 2
+            else
+                echo "❌ Error: --client-runtime-json requires a path"
+                exit 1
+            fi
+            ;;
         *)
             echo "❌ Unknown option: $1"
             show_usage
@@ -168,6 +181,10 @@ fi
 
 if [ -n "$BANDWIDTHS_JSON" ] && [ -f "$BANDWIDTHS_JSON" ]; then
     echo "   Using bandwidth tiers: $BANDWIDTHS_JSON"
+fi
+
+if [ -n "$CLIENT_RUNTIME_JSON" ] && [ -f "$CLIENT_RUNTIME_JSON" ]; then
+    echo "   Using client runtime paths: $CLIENT_RUNTIME_JSON"
 fi
 
 cat > "$OUTPUT_FILE" << EOF
@@ -255,8 +272,27 @@ for i in "${!node_names[@]}"; do
     binary_path=$(echo "$node_binary" | awk '{print $1}')
     binary_args=$(echo "$node_binary" | sed "s|^[^ ]*||")
 
+    runtime_binary_path=""
+    if [ -n "$CLIENT_RUNTIME_JSON" ] && [ -f "$CLIENT_RUNTIME_JSON" ]; then
+        runtime_binary_path=$(CLIENT_RUNTIME_JSON="$CLIENT_RUNTIME_JSON" CLIENT="$client" python3 - <<'PY'
+import json
+import os
+
+path = os.environ["CLIENT_RUNTIME_JSON"]
+client = os.environ["CLIENT"]
+with open(path) as f:
+    runtime = json.load(f)
+print(runtime.get(client, {}).get("path", ""))
+PY
+)
+    fi
+
+    if [ -n "$runtime_binary_path" ]; then
+        binary_path="$runtime_binary_path"
+    fi
+
     # Make binary path absolute
-    if [[ "$binary_path" != /* ]]; then
+    if [ -z "$runtime_binary_path" ] && [[ "$binary_path" != /* ]]; then
         binary_path="$(cd "$(dirname "$binary_path")" 2>/dev/null && pwd)/$(basename "$binary_path")" 2>/dev/null || binary_path="$PROJECT_ROOT/${binary_path#./}"
     fi
 
