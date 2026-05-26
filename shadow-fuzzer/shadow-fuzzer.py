@@ -99,17 +99,23 @@ def _docker_client_executable_path(client: str, executable: str) -> str:
 
 
 def _resolve_image_executable_path(image: str, executable: str) -> str:
-    subprocess.run(
-        ["docker", "pull", "--platform", "linux/arm64", image],
-        check=True,
-    )
-
     inspect = subprocess.run(
         ["docker", "image", "inspect", image],
-        check=True,
+        check=False,
         capture_output=True,
         text=True,
     )
+    if inspect.returncode != 0:
+        subprocess.run(
+            ["docker", "pull", "--platform", "linux/arm64", image],
+            check=True,
+        )
+        inspect = subprocess.run(
+            ["docker", "image", "inspect", image],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
     image_info = json.loads(inspect.stdout)[0]
     entrypoint = image_info.get("Config", {}).get("Entrypoint") or []
     if entrypoint:
@@ -487,7 +493,7 @@ def _run_shadow_yaml(run_dir: Path, resolved: dict[str, Any]) -> None:
     shadow_yaml = run_dir / "shadow.yaml"
     topology_gml = run_dir / "topology.gml"
     bandwidths_json = run_dir / "bandwidths.json"
-    client_runtime_json = run_dir / "client-runtime.json"
+    metadata_json = run_dir / "run-metadata.json"
 
     cmd: list[str] = [
         "bash",
@@ -513,8 +519,8 @@ def _run_shadow_yaml(run_dir: Path, resolved: dict[str, Any]) -> None:
             str(bandwidths_json),
         ]
 
-    if client_runtime_json.is_file():
-        cmd += ["--client-runtime-json", str(client_runtime_json)]
+    if "client_runtime" in resolved and metadata_json.is_file():
+        cmd += ["--client-runtime-json", str(metadata_json)]
 
     subprocess.run(cmd, check=True)
 
@@ -705,11 +711,6 @@ def main() -> None:
         metadata_path.write_text(json.dumps(metadata, indent=2))
         print(f"  Wrote {metadata_path}")
 
-        if "client_runtime" in resolved:
-            client_runtime_path = run_dir / "client-runtime.json"
-            client_runtime_path.write_text(json.dumps(resolved["client_runtime"], indent=2))
-            print(f"  Wrote {client_runtime_path}")
-
         generate_genesis = not dry_run
 
         if generate_genesis:
@@ -732,7 +733,16 @@ def main() -> None:
             print("  [dry-run] Writing metadata-only stats.json")
             dry_stats = {
                 "blocks": {"slots": [], "summary": {"warning": "dry-run: no simulation data"}},
-                "attestations": {"slots": [], "summary": {"warning": "dry-run: no simulation data"}},
+                "attestations": {
+                    "slots": [],
+                    "summary": {"warning": "dry-run: no simulation data"},
+                    "coverage": {
+                        "target_attestation_coverage": 0.95,
+                        "node_percentiles": [0.5, 0.9, 0.95],
+                        "slots": [],
+                        "summary": {"warning": "dry-run: no simulation data"},
+                    },
+                },
                 "node_distribution": {
                     "clients": metadata["node_counts"],
                     "regions": {},

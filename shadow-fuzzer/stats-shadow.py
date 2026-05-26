@@ -14,23 +14,58 @@ Usage:
 """
 
 import json
+import math
 import re
 import sys
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 SHADOW_TS_RE = re.compile(
     r"\d+\.\d+\.\d+\s+(\d+):(\d+):(\d+)\.(\d+)"
 )
+ZEAM_TS_RE = re.compile(
+    r"[A-Z][a-z]{2}-\d{2}\s+(\d+):(\d+):(\d+)\.(\d+)"
+)
+SHADOW_EPOCH_MS = 946684800000
 
 
 def parse_shadow_timestamp(line: str) -> float:
+    line = ANSI_RE.sub("", line)
     m = SHADOW_TS_RE.search(line)
     if m:
         h, mi, s, us = m.groups()
         return int(h) * 3600 + int(mi) * 60 + int(s) + int(us) / 1_000_000
+    m = ZEAM_TS_RE.search(line)
+    if m:
+        h, mi, s, ms = m.groups()
+        return int(h) * 3600 + int(mi) * 60 + int(s) + int(ms) / 1_000
     return 0.0
+
+
+def _event_ts_ms(evt: dict[str, Any]) -> float:
+    ts_ms = float(evt.get("ts_ms", evt.get("ts", 0) * 1000))
+    if ts_ms >= SHADOW_EPOCH_MS:
+        return ts_ms - SHADOW_EPOCH_MS
+    return ts_ms
+
+
+def _nearest_rank(values: list[float], percentile: float, denominator: int | None = None) -> float | None:
+    if not values:
+        return None
+    n = denominator if denominator is not None else len(values)
+    idx = max(0, math.ceil(percentile * n) - 1)
+    if idx >= len(values):
+        return None
+    return sorted(values)[idx]
+
+
+def _median(values: list[float]) -> float | None:
+    if not values:
+        return None
+    s = sorted(values)
+    return s[len(s) // 2]
 
 
 def _parse_interop_attestation(line: str) -> dict[str, Any] | None:
@@ -54,6 +89,7 @@ def _parse_interop_attestation(line: str) -> dict[str, Any] | None:
         "head_slot": int(parts[2]),
         "slot": int(parts[3]),
         "block_hash": parts[4],
+        "source": "qlean_structured",
     }
 
 
@@ -75,6 +111,7 @@ def _parse_interop_publish_block(line: str) -> dict[str, Any] | None:
         "slot": int(slot_m.group(1)),
         "block_hash": hash_m.group(1) if hash_m else "",
         "proposer": int(proposer_m.group(1)) if proposer_m else 0,
+        "source": "qlean_structured",
     }
 
 
@@ -95,6 +132,7 @@ def _parse_interop_publish_attestation(line: str) -> dict[str, Any] | None:
         "ts_ms": ts_ms,
         "validator_id": validator_id,
         "slot": int(parts[3]),
+        "source": "qlean_structured",
     }
 
 
@@ -108,6 +146,23 @@ def _parse_zeam_receive_attestation(line: str) -> dict[str, Any] | None:
         "ts": parse_shadow_timestamp(line),
         "slot": int(m.group(1)),
         "validator_id": int(m.group(2)),
+        "source": "zeam_text",
+    }
+
+
+def _parse_qlean_receive_block(line: str) -> dict[str, Any] | None:
+    m = re.search(
+        r"Received block 0x([0-9a-fA-F]+)\s+@\s+(\d+)\s+parent=0x([0-9a-fA-F]+)",
+        line,
+    )
+    if not m:
+        return None
+    return {
+        "ts": parse_shadow_timestamp(line),
+        "slot": int(m.group(2)),
+        "block_hash": m.group(1).lower(),
+        "parent": m.group(3).lower(),
+        "source": "qlean_text",
     }
 
 
@@ -121,6 +176,7 @@ def _parse_zeam_receive_block(line: str) -> dict[str, Any] | None:
         "ts": parse_shadow_timestamp(line),
         "slot": int(m.group(1)),
         "proposer": int(m.group(2)),
+        "source": "zeam_text",
     }
 
 
@@ -134,6 +190,7 @@ def _parse_zeam_publish_block(line: str) -> dict[str, Any] | None:
         "ts": parse_shadow_timestamp(line),
         "slot": int(m.group(1)),
         "proposer": int(m.group(2)),
+        "source": "zeam_text",
     }
 
 
@@ -147,6 +204,7 @@ def _parse_zeam_publish_attestation(line: str) -> dict[str, Any] | None:
         "ts": parse_shadow_timestamp(line),
         "slot": int(m.group(1)),
         "validator_id": int(m.group(2)),
+        "source": "zeam_text",
     }
 
 
@@ -161,6 +219,10 @@ def _read_host_events(
                     yield host_name, line.rstrip("\n")
         for stderr_file in sorted(host_dir.glob("*.stderr")):
             with open(stderr_file, errors="replace") as f:
+                for line in f:
+                    yield host_name, line.rstrip("\n")
+        for consensus_log in sorted(host_dir.glob("**/consensus.log")):
+            with open(consensus_log, errors="replace") as f:
                 for line in f:
                     yield host_name, line.rstrip("\n")
 
@@ -197,6 +259,10 @@ def _read_host_events(
                     e = _parse_zeam_receive_attestation(line)
                     if e:
                         _append("receive_attestation", host_name, e)
+                elif "Received block 0x" in line:
+                    e = _parse_qlean_receive_block(line)
+                    if e:
+                        _append("receive_block", host_name, e)
                 elif "received gossip block for slot=" in line:
                     e = _parse_zeam_receive_block(line)
                     if e:
@@ -239,7 +305,7 @@ def _compute_attestation_slot_stats(
             for evt in host_events:
                 if evt["slot"] != slot:
                     continue
-                ts_val = evt.get("ts_ms", evt.get("ts", 0) * 1000)
+                ts_val = _event_ts_ms(evt)
                 offset = ts_val - genesis_ms
                 vid = evt.get("validator_id", 0)
                 if vid not in received or offset < received[vid]:
@@ -283,6 +349,140 @@ def _compute_attestation_slot_stats(
     return {"slots": slot_stats_list, "summary": summary}
 
 
+def _compute_attestation_coverage_stats(
+    events: dict[str, dict[str, list[dict[str, Any]]]],
+    host_names: list[str],
+) -> dict[str, Any]:
+    target_attestation_coverage = 0.95
+    node_percentiles = [0.5, 0.9, 0.95]
+    pa = events["publish_attestation"]
+    ra = events["receive_attestation"]
+    warnings: list[str] = []
+
+    published_by_slot: dict[int, set[tuple[int, int]]] = defaultdict(set)
+    first_publish_ms_by_slot: dict[int, float] = {}
+    known_times: dict[int, dict[str, dict[tuple[int, int], float]]] = defaultdict(
+        lambda: defaultdict(dict)
+    )
+    saw_zeam_text = False
+
+    for host_name, host_events in pa.items():
+        for evt in host_events:
+            slot = int(evt["slot"])
+            att_id = (slot, int(evt.get("validator_id", 0)))
+            ts_ms = _event_ts_ms(evt)
+            published_by_slot[slot].add(att_id)
+            if slot not in first_publish_ms_by_slot or ts_ms < first_publish_ms_by_slot[slot]:
+                first_publish_ms_by_slot[slot] = ts_ms
+            previous = known_times[slot][host_name].get(att_id)
+            if previous is None or ts_ms < previous:
+                known_times[slot][host_name][att_id] = ts_ms
+            saw_zeam_text = saw_zeam_text or evt.get("source") == "zeam_text"
+
+    for host_name, host_events in ra.items():
+        for evt in host_events:
+            slot = int(evt["slot"])
+            att_id = (slot, int(evt.get("validator_id", 0)))
+            ts_ms = _event_ts_ms(evt)
+            previous = known_times[slot][host_name].get(att_id)
+            if previous is None or ts_ms < previous:
+                known_times[slot][host_name][att_id] = ts_ms
+            saw_zeam_text = saw_zeam_text or evt.get("source") == "zeam_text"
+
+    slot_stats: list[dict[str, Any]] = []
+    n_nodes = len(host_names)
+    for slot in sorted(published_by_slot.keys()):
+        published = published_by_slot[slot]
+        n_published = len(published)
+        if n_published == 0:
+            warnings.append(f"slot {slot}: no published attestations")
+            continue
+        if n_nodes == 0:
+            warnings.append(f"slot {slot}: no hosts found")
+            continue
+
+        threshold = math.ceil(target_attestation_coverage * n_published)
+        first_publish_ms = first_publish_ms_by_slot[slot]
+        node_threshold_times: list[float] = []
+
+        for host_name in host_names:
+            host_known = known_times[slot].get(host_name, {})
+            times = sorted(
+                ts for att_id, ts in host_known.items() if att_id in published
+            )
+            if len(times) >= threshold:
+                node_threshold_times.append(times[threshold - 1] - first_publish_ms)
+
+        node_threshold_times.sort()
+        n_reached = len(node_threshold_times)
+        slot_d: dict[str, Any] = {
+            "slot": slot,
+            "n_published_attestations": n_published,
+            "n_nodes": n_nodes,
+            "attestation_threshold": threshold,
+            "n_nodes_reached_threshold": n_reached,
+        }
+
+        percentile_fields = {
+            0.5: "p50_nodes_to_95_attestations_ms",
+            0.9: "p90_nodes_to_95_attestations_ms",
+            0.95: "p95_nodes_to_95_attestations_ms",
+        }
+        for percentile, field_name in percentile_fields.items():
+            val = _nearest_rank(node_threshold_times, percentile, denominator=n_nodes)
+            if val is not None:
+                slot_d[field_name] = round(val, 1)
+
+        if node_threshold_times:
+            slot_d["max_nodes_to_95_attestations_ms"] = round(node_threshold_times[-1], 1)
+        if n_reached < math.ceil(0.95 * n_nodes):
+            slot_d["warning"] = (
+                f"only {n_reached}/{n_nodes} nodes reached 95% attestation coverage"
+            )
+            warnings.append(f"slot {slot}: {slot_d['warning']}")
+
+        slot_stats.append(slot_d)
+
+    if not published_by_slot:
+        warnings.append("No attestation publish events found")
+    if saw_zeam_text:
+        warnings.append(
+            "zeam text fallback uses (slot, validator_id), not a cryptographic attestation ID"
+        )
+
+    summary: dict[str, Any] = {}
+    slots_with_all_fields = [
+        s for s in slot_stats
+        if "p50_nodes_to_95_attestations_ms" in s
+        and "p90_nodes_to_95_attestations_ms" in s
+        and "p95_nodes_to_95_attestations_ms" in s
+    ]
+    if slots_with_all_fields:
+        summary["slots_with_data"] = len(slots_with_all_fields)
+        fields = [
+            "p50_nodes_to_95_attestations_ms",
+            "p90_nodes_to_95_attestations_ms",
+            "p95_nodes_to_95_attestations_ms",
+        ]
+        for field in fields:
+            vals = [float(s[field]) for s in slots_with_all_fields]
+            median_val = _median(vals)
+            if median_val is not None:
+                summary[f"median_slot_{field}"] = round(median_val, 1)
+    else:
+        summary["warning"] = "Insufficient data for attestation coverage stats"
+
+    if warnings:
+        summary["warnings"] = warnings
+
+    return {
+        "target_attestation_coverage": target_attestation_coverage,
+        "node_percentiles": node_percentiles,
+        "slots": slot_stats,
+        "summary": summary,
+    }
+
+
 def _compute_block_slot_stats(
     events: dict[str, dict[str, list[dict[str, Any]]]],
     genesis_ms: int,
@@ -294,13 +494,21 @@ def _compute_block_slot_stats(
     for host_events in pb.values():
         for evt in host_events:
             slot = evt["slot"]
-            block_slots[slot] = {
-                "slot": slot,
-                "proposer": evt.get("proposer", 0),
-                "block_hash": evt.get("block_hash", ""),
-                "published": True,
-                "receive_timestamps_ms": {},
-            }
+            publish_ms = round(_event_ts_ms(evt) - genesis_ms, 1)
+            if slot not in block_slots:
+                block_slots[slot] = {
+                    "slot": slot,
+                    "proposer": evt.get("proposer", 0),
+                    "block_hash": evt.get("block_hash", ""),
+                    "receive_timestamps_ms": {},
+                }
+            block_slots[slot]["proposer"] = evt.get("proposer", 0)
+            block_slots[slot]["block_hash"] = evt.get("block_hash", "")
+            if (
+                "published_ms" not in block_slots[slot]
+                or publish_ms < block_slots[slot]["published_ms"]
+            ):
+                block_slots[slot]["published_ms"] = publish_ms
 
     if rb:
         for host_name, host_events in rb.items():
@@ -311,13 +519,13 @@ def _compute_block_slot_stats(
                         "slot": slot,
                         "proposer": evt.get("proposer", 0),
                         "block_hash": "",
-                        "published": False,
                         "receive_timestamps_ms": {},
                     }
-                ts_val = evt.get("ts_ms", evt.get("ts", 0) * 1000)
-                block_slots[slot]["receive_timestamps_ms"][host_name] = round(
-                    ts_val - genesis_ms, 1
-                )
+                ts_val = _event_ts_ms(evt)
+                offset = round(ts_val - genesis_ms, 1)
+                reception = block_slots[slot]["receive_timestamps_ms"]
+                if host_name not in reception or offset < reception[host_name]:
+                    reception[host_name] = offset
 
     slot_list: list[dict[str, Any]] = []
     for slot in sorted(block_slots.keys()):
@@ -326,8 +534,9 @@ def _compute_block_slot_stats(
         slot_d = {
             "slot": slot,
             "proposer": s["proposer"],
-            "published": s["published"],
         }
+        if "published_ms" in s:
+            slot_d["published_ms"] = s["published_ms"]
         if reception:
             times = sorted(reception.values())
             slot_d["first_receive_ms"] = times[0]
@@ -338,7 +547,7 @@ def _compute_block_slot_stats(
 
     summary: dict[str, Any] = {}
     if slot_list:
-        published = [s for s in slot_list if s["published"]]
+        published = [s for s in slot_list if "published_ms" in s]
         received = [s for s in slot_list if "first_receive_ms" in s]
         summary["n_published"] = len(published)
         summary["n_received"] = len(received)
@@ -352,6 +561,30 @@ def _load_json(path: Path) -> dict[str, Any]:
     if path.is_file():
         return json.loads(path.read_text())
     return {}
+
+
+def _summarize_event_counts(
+    events: dict[str, dict[str, list[dict[str, Any]]]],
+) -> dict[str, Any]:
+    summary: dict[str, Any] = {}
+    for kind, by_host in events.items():
+        total = 0
+        by_source: dict[str, int] = {}
+        by_host_counts: dict[str, int] = {}
+        for host_name, host_events in by_host.items():
+            if not host_events:
+                continue
+            by_host_counts[host_name] = len(host_events)
+            total += len(host_events)
+            for evt in host_events:
+                source = str(evt.get("source", "unknown"))
+                by_source[source] = by_source.get(source, 0) + 1
+        summary[kind] = {
+            "total": total,
+            "by_source": dict(sorted(by_source.items())),
+            "by_host": dict(sorted(by_host_counts.items())),
+        }
+    return summary
 
 
 def collect_stats(run_dir: str, metadata: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -380,7 +613,17 @@ def collect_stats(run_dir: str, metadata: dict[str, Any] | None = None) -> dict[
                 "clients": metadata.get("node_counts", {}),
             },
             "blocks": {"slots": [], "summary": {"warning": warnings[0]}},
-            "attestations": {"slots": [], "summary": {"warning": warnings[0]}},
+            "attestations": {
+                "slots": [],
+                "summary": {"warning": warnings[0]},
+                "coverage": {
+                    "target_attestation_coverage": 0.95,
+                    "node_percentiles": [0.5, 0.9, 0.95],
+                    "slots": [],
+                    "summary": {"warning": warnings[0]},
+                },
+            },
+            "event_counts": {},
             "warnings": warnings,
         }
         for key in (
@@ -391,6 +634,7 @@ def collect_stats(run_dir: str, metadata: dict[str, Any] | None = None) -> dict[
                 result[key] = metadata[key]
         return result
 
+    host_names = sorted(p.name for p in hosts_dir.iterdir() if p.is_dir())
     events = _read_host_events(hosts_dir)
 
     total_receive_att = sum(len(v) for v in events["receive_attestation"].values())
@@ -406,12 +650,15 @@ def collect_stats(run_dir: str, metadata: dict[str, Any] | None = None) -> dict[
     genesis_ms = 0
     for host_events in events["receive_attestation"].values():
         for evt in host_events:
-            ts_val = evt.get("ts_ms", evt.get("ts", 0) * 1000)
+            ts_val = _event_ts_ms(evt)
             if genesis_ms == 0 or ts_val < genesis_ms:
                 genesis_ms = ts_val
     genesis_ms = (genesis_ms // 1_000_000) * 1_000_000
 
     attestation_stats = _compute_attestation_slot_stats(events, int(genesis_ms))
+    attestation_stats["coverage"] = _compute_attestation_coverage_stats(
+        events, host_names
+    )
     block_stats = _compute_block_slot_stats(events, int(genesis_ms))
 
     region_counts: dict[str, int] = {}
@@ -427,6 +674,7 @@ def collect_stats(run_dir: str, metadata: dict[str, Any] | None = None) -> dict[
     result: dict[str, Any] = {
         "blocks": block_stats,
         "attestations": attestation_stats,
+        "event_counts": _summarize_event_counts(events),
         "node_distribution": {
             "clients": node_counts,
             "regions": region_counts,

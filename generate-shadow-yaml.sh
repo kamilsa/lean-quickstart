@@ -32,7 +32,7 @@ Options:
   --shadow-data-dir <path> Shadow data output directory (default: <project-root>/shadow.data)
   --topology-gml <path>    GML topology file; enables geo-latency graph mode
   --bandwidths-json <path> JSON file mapping node_N → bandwidth tier
-  --client-runtime-json <path> JSON file mapping client names to Shadow process paths
+  --client-runtime-json <path> JSON file with client runtime paths, or run-metadata.json
 
 This script is client-agnostic. It reads node names from validator-config.yaml,
 extracts the client name from the node prefix (e.g., zeam_0 → zeam), and sources
@@ -282,6 +282,7 @@ path = os.environ["CLIENT_RUNTIME_JSON"]
 client = os.environ["CLIENT"]
 with open(path) as f:
     runtime = json.load(f)
+runtime = runtime.get("client_runtime", runtime)
 print(runtime.get(client, {}).get("path", ""))
 PY
 )
