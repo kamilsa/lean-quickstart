@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import contextlib
+import io
 import json
 import re
 from pathlib import Path
@@ -230,3 +232,12 @@ def max_simulated_seconds_from_run(run_dir: str | Path) -> float:
     for event in events_from_run(run_dir):
         max_ms = max(max_ms, float(event.get("ts_ms") or 0.0))
     return max_ms / 1000
+
+
+def stats_from_run(run_dir: str | Path, metadata: dict[str, Any] | None = None) -> dict[str, Any]:
+    run_path = Path(run_dir)
+    if metadata is None:
+        metadata_path = run_path / "run-metadata.json"
+        metadata = json.loads(metadata_path.read_text()) if metadata_path.is_file() else {}
+    with contextlib.redirect_stdout(io.StringIO()):
+        return _STATS_SHADOW.collect_stats(str(run_path), metadata)

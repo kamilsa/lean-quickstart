@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from dashboard_events import event_key, events_from_run
+from dashboard_time import chain_slot_from_simulated_seconds
 
 
 TERMINAL_STATUSES = {"complete", "warning", "error"}
@@ -106,6 +107,35 @@ def _metadata_duration(metadata: dict[str, Any]) -> float | None:
     return None
 
 
+def initial_stats_from_metadata(metadata: dict[str, Any], warnings: list[str] | None = None) -> dict[str, Any]:
+    warning_list = list(warnings or [])
+    return {
+        "blocks": {"slots": [], "summary": {"warning": "no block data indexed yet"}},
+        "chain_status": {
+            "slots": [],
+            "summary": {"warning": "no chain status data indexed yet"},
+        },
+        "attestations": {
+            "slots": [],
+            "summary": {"warning": "no attestation data indexed yet"},
+            "coverage": {
+                "target_attestation_coverage": 0.95,
+                "node_percentiles": [0.5, 0.9, 0.95],
+                "slots": [],
+                "summary": {"warning": "no attestation data indexed yet"},
+            },
+        },
+        "event_counts": {},
+        "node_distribution": {
+            "clients": metadata.get("node_counts", {}),
+            "regions": {},
+            "bandwidths": {},
+        },
+        "warnings": warning_list,
+        **metadata,
+    }
+
+
 class DashboardDB:
     def __init__(self, db_path: str | Path) -> None:
         self.db_path = Path(db_path)
@@ -182,13 +212,14 @@ class DashboardDB:
     ) -> None:
         now = utc_now()
         warnings = warnings or []
+        initial_stats = initial_stats_from_metadata(metadata, warnings)
         with self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO runs (
                     run_id, run_index, seed, status, stage, run_dir,
-                    started_at, updated_at, duration_secs, warnings, metadata
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    started_at, updated_at, duration_secs, warnings, metadata, stats
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(run_id) DO UPDATE SET
                     run_index=excluded.run_index,
                     seed=excluded.seed,
@@ -198,7 +229,11 @@ class DashboardDB:
                     updated_at=excluded.updated_at,
                     duration_secs=excluded.duration_secs,
                     warnings=excluded.warnings,
-                    metadata=excluded.metadata
+                    metadata=excluded.metadata,
+                    stats=CASE
+                        WHEN runs.stats = '{}' THEN excluded.stats
+                        ELSE runs.stats
+                    END
                 """,
                 (
                     run_id,
@@ -212,6 +247,7 @@ class DashboardDB:
                     _metadata_duration(metadata),
                     _json_dumps(warnings),
                     _json_dumps(metadata),
+                    _json_dumps(initial_stats),
                 ),
             )
 
@@ -238,7 +274,7 @@ class DashboardDB:
         duration = duration_secs or 0
         progress = simulated_seconds / duration if duration > 0 else 0.0
         progress = max(0.0, min(1.0, progress))
-        current_slot = max(0, int(math.floor(simulated_seconds / 4)))
+        current_slot = chain_slot_from_simulated_seconds(simulated_seconds)
         with self._connect() as conn:
             conn.execute(
                 """
@@ -282,7 +318,7 @@ class DashboardDB:
                 except ValueError:
                     wall_seconds = 0.0
             simulated_seconds = float(duration_secs or stats.get("fuzzer", {}).get("duration_secs") or 0)
-            current_slot = max(0, int(math.floor(simulated_seconds / 4)))
+            current_slot = chain_slot_from_simulated_seconds(simulated_seconds)
             conn.execute(
                 """
                 UPDATE runs
@@ -309,6 +345,37 @@ class DashboardDB:
                     simulated_seconds,
                     current_slot,
                     simulated_seconds,
+                    run_id,
+                ),
+            )
+
+    def update_stats_snapshot(
+        self,
+        run_id: str,
+        stats: dict[str, Any],
+        warnings: list[str] | None = None,
+    ) -> None:
+        with self._connect() as conn:
+            existing = conn.execute(
+                "SELECT warnings FROM runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if not existing:
+                return
+            merged_warnings = list(dict.fromkeys([
+                *_json_loads(existing["warnings"], []),
+                *(warnings if warnings is not None else stats.get("warnings", [])),
+            ]))
+            conn.execute(
+                """
+                UPDATE runs
+                SET stats = ?, warnings = ?, updated_at = ?
+                WHERE run_id = ?
+                """,
+                (
+                    _json_dumps(stats),
+                    _json_dumps(merged_warnings),
+                    utc_now(),
                     run_id,
                 ),
             )
@@ -522,7 +589,33 @@ class DashboardDB:
             by_slot[slot]["attestation_nodes"] = coverage.get("n_nodes", 0)
             if coverage.get("warning"):
                 by_slot[slot]["warning"] = coverage["warning"]
+        for slot in self._event_slots(run_id):
+            by_slot.setdefault(slot, {"slot": slot})
+            by_slot[slot]["block_count"] = self._block_count_for_slot(run_id, slot)
         return {"run_id": run_id, "slots": [by_slot[s] for s in sorted(by_slot)]}
+
+    def _event_slots(self, run_id: str) -> list[int]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT DISTINCT slot FROM events
+                WHERE run_id = ?
+                  AND slot IS NOT NULL
+                  AND kind IN (
+                    'block_published',
+                    'block_received',
+                    'attestation_sent',
+                    'attestation_received',
+                    'aggregation_received',
+                    'justified',
+                    'finalized',
+                    'chain_status'
+                  )
+                ORDER BY slot ASC
+                """,
+                (run_id,),
+            ).fetchall()
+        return [int(row["slot"]) for row in rows]
 
     def _block_count_for_slot(self, run_id: str, slot: int) -> int:
         return len(self._block_keys_for_slot(run_id, slot))
@@ -584,6 +677,8 @@ class DashboardDB:
             if int(item.get("slot", -1)) == slot:
                 block_slot = item
                 break
+        if block_slot is None and len(blocks) == 1:
+            block_slot = self._live_block_slot_from_events(run_id, slot)
 
         coverage_slot = None
         for item in stats.get("attestations", {}).get("coverage", {}).get("slots", []):
@@ -630,6 +725,55 @@ class DashboardDB:
             "cdf": cdf,
             "slot_stats": slot_stats,
         }
+
+    def _live_block_slot_from_events(self, run_id: str, slot: int) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM events
+                WHERE run_id = ?
+                  AND slot = ?
+                  AND kind IN ('block_published', 'block_received')
+                ORDER BY ts_ms ASC
+                """,
+                (run_id, slot),
+            ).fetchall()
+        if not rows:
+            return None
+
+        receive_times: dict[str, float] = {}
+        published_ms: float | None = None
+        proposer = None
+        block_hash = ""
+        for row in rows:
+            event = self._row_to_event(row)
+            payload = event["payload"]
+            proposer = payload.get("proposer", proposer)
+            block_hash = payload.get("block_hash", block_hash)
+            if event["kind"] == "block_published":
+                if published_ms is None or event["ts_ms"] < published_ms:
+                    published_ms = float(event["ts_ms"])
+            elif event["kind"] == "block_received" and event.get("host"):
+                host = event["host"]
+                ts_ms = float(event["ts_ms"])
+                if host not in receive_times or ts_ms < receive_times[host]:
+                    receive_times[host] = ts_ms
+
+        if not receive_times:
+            return None
+        times = sorted(receive_times.values())
+        block_slot: dict[str, Any] = {
+            "slot": slot,
+            "proposer": proposer,
+            "block_hash": block_hash,
+            "first_receive_ms": times[0],
+            "last_receive_ms": times[-1],
+            "n_received": len(times),
+            "receive_timestamps_ms": receive_times,
+        }
+        if published_ms is not None:
+            block_slot["published_ms"] = published_ms
+        return block_slot
 
     def get_chain(self, run_id: str) -> dict[str, Any] | None:
         run = self.get_run(run_id)

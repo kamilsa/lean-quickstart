@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import contextlib
+import io
 import json
+import importlib.util
+import shutil
 import sys
 import tempfile
 import unittest
@@ -12,6 +16,13 @@ sys.path.insert(0, str(FUZZER_ROOT))
 from dashboard_db import DashboardDB
 from dashboard_events import events_from_run
 from dashboard_server import create_app
+from dashboard_time import chain_slot_from_simulated_seconds, max_chain_slot_for_duration
+
+FUZZER_SCRIPT = FUZZER_ROOT / "shadow-fuzzer.py"
+_FUZZER_SPEC = importlib.util.spec_from_file_location("shadow_fuzzer_script", FUZZER_SCRIPT)
+assert _FUZZER_SPEC and _FUZZER_SPEC.loader
+shadow_fuzzer_script = importlib.util.module_from_spec(_FUZZER_SPEC)
+_FUZZER_SPEC.loader.exec_module(shadow_fuzzer_script)
 
 
 def _metadata(run_id: str = "silver-quiet-lotus") -> dict:
@@ -123,17 +134,141 @@ class DashboardDBTests(unittest.TestCase):
                 wall_seconds=108.0,
                 duration_secs=120.0,
             )
+            self.assertEqual(db.get_progress("silver-quiet-lotus")["current_slot"], 5)
             db.finish_run("silver-quiet-lotus", status="complete", stats=_stats())
 
             run = db.get_run("silver-quiet-lotus")
             self.assertIsNotNone(run)
             self.assertEqual(run["status"], "complete")
-            self.assertEqual(db.get_progress("silver-quiet-lotus")["current_slot"], 30)
+            self.assertEqual(db.get_progress("silver-quiet-lotus")["current_slot"], 15)
 
             detail = db.get_slot_detail("silver-quiet-lotus", 8)
             self.assertEqual(detail["state"], "ok")
             self.assertEqual(detail["slot_stats"]["n_received"], 3)
             self.assertEqual(detail["cdf"][-1]["percent"], 100.0)
+
+    def test_slot_helpers_account_for_genesis_delay(self) -> None:
+        self.assertEqual(chain_slot_from_simulated_seconds(0), 0)
+        self.assertEqual(chain_slot_from_simulated_seconds(59.9), 0)
+        self.assertEqual(chain_slot_from_simulated_seconds(60), 0)
+        self.assertEqual(chain_slot_from_simulated_seconds(64), 1)
+        self.assertEqual(chain_slot_from_simulated_seconds(82), 5)
+        self.assertEqual(max_chain_slot_for_duration(120), 15)
+
+    def test_initial_and_live_data_before_stats_json(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db = DashboardDB(root / "runs.db")
+            db.start_run("live-run", root / "live-run", _metadata("live-run"))
+
+            run = db.get_run("live-run")
+            self.assertEqual(run["stats"]["node_distribution"]["clients"]["qlean"], 5)
+
+            db.insert_events(
+                "live-run",
+                [
+                    {
+                        "kind": "block_published",
+                        "host": "qlean_0",
+                        "slot": 4,
+                        "ts_ms": 76000,
+                        "message": "qlean_0 published block",
+                        "payload": {"block_hash": "aaaa", "proposer": 1},
+                    },
+                    {
+                        "kind": "block_received",
+                        "host": "qlean_1",
+                        "slot": 4,
+                        "ts_ms": 76100,
+                        "message": "qlean_1 received block",
+                        "payload": {"block_hash": "aaaa", "proposer": 1},
+                    },
+                    {
+                        "kind": "block_received",
+                        "host": "zeam_0",
+                        "slot": 4,
+                        "ts_ms": 76400,
+                        "message": "zeam_0 received block",
+                        "payload": {"block_hash": "aaaa", "proposer": 1},
+                    },
+                ],
+            )
+
+            slots = db.get_slots("live-run")["slots"]
+            self.assertEqual(slots[0]["slot"], 4)
+            detail = db.get_slot_detail("live-run", 4)
+            self.assertEqual(detail["state"], "ok")
+            self.assertEqual(detail["slot_stats"]["n_received"], 2)
+            self.assertEqual(detail["cdf"][-1]["latency_ms"], 300.0)
+
+    def test_hash_sig_key_cache_helpers_use_validator_count_and_active_epoch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            genesis = root / "run" / "genesis"
+            keys = genesis / "hash-sig-keys"
+            keys.mkdir(parents=True)
+            (genesis / "validator-config.yaml").write_text(
+                """
+config:
+  activeEpoch: 18
+validators:
+  - name: qlean_0
+    count: 1
+  - name: zeam_0
+    count: 2
+"""
+            )
+            (keys / "validator-keys-manifest.yaml").write_text("validators: []\n")
+            (keys / "validator_0_pk.ssz").write_text("pk")
+
+            cache_root = root / "cache"
+            cache_dir = cache_root / "validators-3-active-18"
+            self.assertEqual(shadow_fuzzer_script._hash_sig_cache_key(genesis), "validators-3-active-18")
+            with contextlib.redirect_stdout(io.StringIO()):
+                shadow_fuzzer_script._store_hash_sig_key_cache(genesis, cache_dir)
+            self.assertTrue((cache_dir / "validator_0_pk.ssz").is_file())
+
+            shutil.rmtree(keys)
+            with contextlib.redirect_stdout(io.StringIO()):
+                restored = shadow_fuzzer_script._restore_hash_sig_key_cache(genesis, cache_root)
+            self.assertEqual(restored, cache_dir)
+            self.assertTrue((keys / "validator_0_pk.ssz").is_file())
+
+    def test_clean_dashboard_db_removes_sqlite_files_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for filename in ("runs.db", "runs.db-shm", "runs.db-wal"):
+                (root / filename).write_text("db")
+            keep = root / "some-run"
+            keep.mkdir()
+
+            removed = shadow_fuzzer_script._clean_dashboard_db(root)
+            self.assertEqual({path.name for path in removed}, {"runs.db", "runs.db-shm", "runs.db-wal"})
+            self.assertFalse((root / "runs.db").exists())
+            self.assertTrue(keep.is_dir())
+
+    def test_clean_output_dir_preserves_hash_sig_key_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for filename in ("runs.db", "runs.db-shm", "runs.db-wal"):
+                (root / filename).write_text("db")
+            run_dir = root / "silver-quiet-lotus"
+            run_dir.mkdir()
+            (run_dir / "run-metadata.json").write_text("{}")
+            build_dir = root / "_docker-build"
+            build_dir.mkdir()
+            (build_dir / "Dockerfile").write_text("FROM scratch\n")
+            cache_dir = root / shadow_fuzzer_script.HASH_SIG_KEY_CACHE_DIR
+            cache_dir.mkdir()
+            (cache_dir / "validator_0_pk.ssz").write_text("pk")
+
+            removed = shadow_fuzzer_script._clean_output_dir(root)
+            self.assertEqual(
+                {path.name for path in removed},
+                {"runs.db", "runs.db-shm", "runs.db-wal", "silver-quiet-lotus", "_docker-build"},
+            )
+            self.assertEqual([path.name for path in root.iterdir()], [shadow_fuzzer_script.HASH_SIG_KEY_CACHE_DIR])
+            self.assertTrue((cache_dir / "validator_0_pk.ssz").is_file())
 
     def test_reindex_existing_output_dir(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

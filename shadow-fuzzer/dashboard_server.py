@@ -74,13 +74,19 @@ def _download_response(data: bytes, filename: str) -> Response:
     )
 
 
-def create_app(output_dir: str | Path, static_dir: str | Path | None = None) -> FastAPI:
+def create_app(
+    output_dir: str | Path,
+    static_dir: str | Path | None = None,
+    *,
+    reindex: bool = True,
+) -> FastAPI:
     output_path = Path(output_dir).resolve()
     output_path.mkdir(parents=True, exist_ok=True)
     db = DashboardDB(output_path / "runs.db")
-    indexed = db.reindex_output_dir(output_path)
-    if indexed:
-        print(f"Dashboard indexed {indexed} existing run(s) from {output_path}")
+    if reindex:
+        indexed = db.reindex_output_dir(output_path)
+        if indexed:
+            print(f"Dashboard indexed {indexed} existing run(s) from {output_path}")
 
     static_path = Path(static_dir).resolve() if static_dir else _find_static_dir()
     manager = ConnectionManager()
@@ -278,11 +284,17 @@ def create_app(output_dir: str | Path, static_dir: str | Path | None = None) -> 
     return app
 
 
-def run_server(output_dir: str | Path, host: str = "127.0.0.1", port: int = 8000) -> None:
+def run_server(
+    output_dir: str | Path,
+    host: str = "127.0.0.1",
+    port: int = 8000,
+    *,
+    reindex: bool = True,
+) -> None:
     import uvicorn
 
     static_dir = _find_static_dir()
-    app = create_app(output_dir, static_dir=static_dir)
+    app = create_app(output_dir, static_dir=static_dir, reindex=reindex)
     print(f"Shadow fuzzer dashboard: http://{host}:{port}")
     print(f"Indexing output dir: {Path(output_dir).resolve()}")
     if static_dir:
@@ -296,11 +308,13 @@ def start_server_background(
     output_dir: str | Path,
     host: str = "127.0.0.1",
     port: int = 8000,
+    *,
+    reindex: bool = True,
 ) -> threading.Thread:
     import uvicorn
 
     static_dir = _find_static_dir()
-    app = create_app(output_dir, static_dir=static_dir)
+    app = create_app(output_dir, static_dir=static_dir, reindex=reindex)
     config = uvicorn.Config(app, host=host, port=port, log_level="warning")
     server = uvicorn.Server(config)
     thread = threading.Thread(target=server.run, daemon=True)

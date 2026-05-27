@@ -130,6 +130,8 @@ const EVENT_KINDS = [
 ]
 
 const COLORS = ['#2563eb', '#16a34a', '#7c3aed', '#d97706', '#0891b2', '#475569']
+const GENESIS_DELAY_SECONDS = 60
+const SLOT_SECONDS = 4
 
 function api<T>(path: string): Promise<T> {
   return fetch(path).then((res) => {
@@ -160,6 +162,11 @@ function statusClass(status?: string) {
 function objectEntries(obj?: Record<string, number>) {
   if (!obj) return []
   return Object.entries(obj).map(([name, value]) => ({ name, value }))
+}
+
+function maxChainSlotForDuration(duration?: number | null) {
+  if (duration == null) return 0
+  return Math.max(0, Math.floor((duration - GENESIS_DELAY_SECONDS) / SLOT_SECONDS))
 }
 
 export default function App() {
@@ -266,7 +273,7 @@ export default function App() {
   const regionCounts = objectEntries(run?.stats?.node_distribution?.regions)
   const bandwidthCounts = objectEntries(run?.stats?.node_distribution?.bandwidths)
   const duration = selectedSummary?.duration_secs ?? run?.metadata?.fuzzer?.duration_secs ?? 0
-  const maxSlot = Math.max(Math.ceil((duration || 0) / 4), selectedSummary?.current_slot ?? 0, 1)
+  const maxSlot = Math.max(maxChainSlotForDuration(duration), selectedSummary?.current_slot ?? 0, 0)
 
   return (
     <div className="app-shell">
@@ -300,7 +307,9 @@ export default function App() {
                     }}
                   >
                     <span>
-                      <strong>{item.run_id}</strong>
+                      <strong>
+                        Run {item.run_index != null ? item.run_index + 1 : '--'} · {item.run_id}
+                      </strong>
                       <small>seed {item.seed ?? '--'} · slot {item.current_slot}</small>
                     </span>
                     <em className={statusClass(item.status)}>{item.status}</em>
@@ -337,8 +346,14 @@ export default function App() {
                 <div className="progress-track">
                   <div style={{ width: `${Math.max(2, progress * 100)}%` }} />
                 </div>
-                <div className="slot-strip" aria-label="slot progress">
-                  {Array.from({ length: Math.min(maxSlot + 1, 48) }, (_, index) => (
+                <div
+                  className="slot-strip"
+                  aria-label="slot progress"
+                  style={{
+                    gridTemplateColumns: `repeat(${maxSlot + 1}, minmax(2px, 1fr))`
+                  }}
+                >
+                  {Array.from({ length: maxSlot + 1 }, (_, index) => (
                     <button
                       key={index}
                       className={clsx(

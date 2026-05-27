@@ -9,6 +9,8 @@ Usage:
   python3 shadow-fuzzer.py [config.toml]
   python3 shadow-fuzzer.py --dry-run config.example.toml
   python3 shadow-fuzzer.py --serve --host 127.0.0.1 --port 8000 config.toml
+  python3 shadow-fuzzer.py --serve --clean-db config.toml
+  python3 shadow-fuzzer.py --serve --clean-output config.toml
 """
 
 from __future__ import annotations
@@ -37,6 +39,8 @@ FUZZER_ROOT = Path(__file__).resolve().parent
 REPO_ROOT = FUZZER_ROOT.parent
 SHADOW_EPOCH = 946684800
 SHADOW_GENESIS_TIME = 946684860
+HASH_SIG_KEY_CACHE_DIR = "_hash-sig-key-cache"
+DASHBOARD_DB_FILES = ("runs.db", "runs.db-shm", "runs.db-wal")
 
 DEFAULT_REGION_WEIGHTS = {
     "us-east": 0.30,
@@ -443,20 +447,64 @@ def _validate_template(template: dict[str, Any]) -> list[str]:
     return errors
 
 
-def _run_genesis(run_dir: Path, base_genesis_dir: str) -> None:
+def _hash_sig_cache_key(genesis_dir: Path) -> str:
+    validator_config = genesis_dir / "validator-config.yaml"
+    with open(validator_config) as f:
+        config = yaml.safe_load(f) or {}
+    validators = config.get("validators", [])
+    validator_count = sum(int(v.get("count", 1)) for v in validators)
+    active_epoch = int(config.get("config", {}).get("activeEpoch", 0))
+    return f"validators-{validator_count}-active-{active_epoch}"
+
+
+def _restore_hash_sig_key_cache(genesis_dir: Path, cache_root: Path | None) -> Path | None:
+    if cache_root is None:
+        return None
+    cache_dir = cache_root / _hash_sig_cache_key(genesis_dir)
+    if not cache_dir.is_dir():
+        return cache_dir
+    target = genesis_dir / "hash-sig-keys"
+    if target.exists():
+        shutil.rmtree(target)
+    shutil.copytree(cache_dir, target)
+    print(f"  Reusing cached hash-sig keys: {cache_dir}")
+    return cache_dir
+
+
+def _store_hash_sig_key_cache(genesis_dir: Path, cache_dir: Path | None) -> None:
+    if cache_dir is None or cache_dir.exists():
+        return
+    source = genesis_dir / "hash-sig-keys"
+    if not source.is_dir():
+        return
+    cache_dir.parent.mkdir(parents=True, exist_ok=True)
+    tmp_dir = cache_dir.with_name(f".{cache_dir.name}.tmp")
+    if tmp_dir.exists():
+        shutil.rmtree(tmp_dir)
+    shutil.copytree(source, tmp_dir)
+    os.replace(tmp_dir, cache_dir)
+    print(f"  Cached hash-sig keys: {cache_dir}")
+
+
+def _run_genesis(
+    run_dir: Path,
+    base_genesis_dir: str,
+    key_cache_root: Path | None = None,
+) -> None:
     run_dir = run_dir.resolve()
     script = REPO_ROOT / "generate-genesis.sh"
     genesis_dir = run_dir / "genesis"
+    cache_dir = _restore_hash_sig_key_cache(genesis_dir, key_cache_root)
     subprocess.run(
         [
             str(script),
             str(genesis_dir),
             "--genesis-time",
             str(SHADOW_GENESIS_TIME),
-            "--forceKeyGen",
         ],
         check=True,
     )
+    _store_hash_sig_key_cache(genesis_dir, cache_dir)
 
 
 def _run_topology(run_dir: Path, resolved: dict[str, Any]) -> None:
@@ -623,6 +671,33 @@ def _validate_resolved(resolved: dict[str, Any]) -> list[str]:
     return warnings
 
 
+def _clean_dashboard_db(output_dir: Path) -> list[Path]:
+    removed: list[Path] = []
+    for filename in DASHBOARD_DB_FILES:
+        path = output_dir / filename
+        try:
+            path.unlink()
+            removed.append(path)
+        except FileNotFoundError:
+            pass
+    return removed
+
+
+def _clean_output_dir(output_dir: Path) -> list[Path]:
+    removed: list[Path] = []
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for path in output_dir.iterdir():
+        if path.name == HASH_SIG_KEY_CACHE_DIR:
+            continue
+
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+        removed.append(path)
+    return removed
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run randomized Shadow fuzzer sweeps")
     parser.add_argument(
@@ -640,6 +715,22 @@ def _parse_args() -> argparse.Namespace:
         "--serve",
         action="store_true",
         help="Start the live dashboard server alongside the fuzzer",
+    )
+    parser.add_argument(
+        "--clean-db",
+        action="store_true",
+        help=(
+            "Remove output_dir/runs.db before starting. With --serve, existing run "
+            "directories are not reindexed into the fresh DB."
+        ),
+    )
+    parser.add_argument(
+        "--clean-output",
+        action="store_true",
+        help=(
+            "Remove previous run files from output_dir before starting, including "
+            "runs.db and run directories, but keep cached hash-sig keys."
+        ),
     )
     parser.add_argument(
         "--host",
@@ -688,17 +779,43 @@ def main() -> None:
     print(f"Config: {config_path_abs}")
     print()
 
+    if args.clean_output:
+        removed = _clean_output_dir(output_dir)
+        if removed:
+            print("Cleaned previous output files:")
+            for path in removed:
+                print(f"  Removed {path}")
+        else:
+            print("Output directory already clean.")
+        print()
+    elif args.clean_db:
+        removed = _clean_dashboard_db(output_dir)
+        if removed:
+            print("Cleaned dashboard database:")
+            for path in removed:
+                print(f"  Removed {path}")
+        else:
+            print("Dashboard database already clean.")
+        print()
+
     dashboard_db = None
+    fresh_dashboard = args.clean_db or args.clean_output
     if args.serve:
         try:
             from dashboard_db import DashboardDB
             from dashboard_server import start_server_background
 
             dashboard_db = DashboardDB(output_dir / "runs.db")
-            indexed = dashboard_db.reindex_output_dir(output_dir)
-            if indexed:
-                print(f"Indexed {indexed} existing dashboard run(s).")
-            start_server_background(output_dir, host=args.host, port=args.port)
+            if not fresh_dashboard:
+                indexed = dashboard_db.reindex_output_dir(output_dir)
+                if indexed:
+                    print(f"Indexed {indexed} existing dashboard run(s).")
+            start_server_background(
+                output_dir,
+                host=args.host,
+                port=args.port,
+                reindex=not fresh_dashboard,
+            )
             print()
         except ImportError as exc:
             print(
@@ -713,6 +830,7 @@ def main() -> None:
         print("Preparing Docker ARM runtime...")
         docker_runtime = _prepare_docker_arm_runtime(template, output_dir, dry_run)
         print()
+    hash_sig_key_cache_root = output_dir / HASH_SIG_KEY_CACHE_DIR
 
     for run_index in range(int(max_runs)):
         print(f"--- Run {run_index + 1}/{max_runs} ---")
@@ -785,11 +903,19 @@ def main() -> None:
                 _run_genesis(
                     run_dir,
                     str(fuzzer.get("base_genesis_dir", "shadow-devnet/genesis")),
+                    key_cache_root=hash_sig_key_cache_root,
                 )
 
             _set_stage("generating_topology")
             print("  Generating topology...")
             _run_topology(run_dir, {**resolved, "_internal": internal})
+            if dashboard_db:
+                from dashboard_events import stats_from_run
+
+                dashboard_db.update_stats_snapshot(
+                    run_id,
+                    stats_from_run(run_dir, metadata),
+                )
 
             _set_stage("generating_shadow_yaml")
             print("  Generating shadow.yaml...")
@@ -820,33 +946,12 @@ def main() -> None:
                 _run_stats(run_dir, metadata_path)
             else:
                 print("  [dry-run] Writing metadata-only stats.json")
-                dry_stats = {
-                    "blocks": {
-                        "slots": [],
-                        "summary": {"warning": "dry-run: no simulation data"},
-                    },
-                    "chain_status": {
-                        "slots": [],
-                        "summary": {"warning": "dry-run: no simulation data"},
-                    },
-                    "attestations": {
-                        "slots": [],
-                        "summary": {"warning": "dry-run: no simulation data"},
-                        "coverage": {
-                            "target_attestation_coverage": 0.95,
-                            "node_percentiles": [0.5, 0.9, 0.95],
-                            "slots": [],
-                            "summary": {"warning": "dry-run: no simulation data"},
-                        },
-                    },
-                    "node_distribution": {
-                        "clients": metadata["node_counts"],
-                        "regions": {},
-                        "bandwidths": {},
-                    },
-                    "warnings": ["dry-run"],
-                }
-                dry_stats.update(metadata)
+                from dashboard_events import stats_from_run
+
+                dry_stats = stats_from_run(run_dir, metadata)
+                dry_stats["warnings"] = list(
+                    dict.fromkeys(["dry-run", *dry_stats.get("warnings", [])])
+                )
                 (run_dir / "stats.json").write_text(json.dumps(dry_stats, indent=2))
                 print(f"  Wrote {run_dir / 'stats.json'}")
 

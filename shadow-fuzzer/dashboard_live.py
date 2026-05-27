@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 
 from dashboard_db import DashboardDB
-from dashboard_events import events_from_run, max_simulated_seconds_from_run
+from dashboard_events import events_from_run, max_simulated_seconds_from_run, stats_from_run
 
 
 class RunLogWatcher:
@@ -57,6 +57,14 @@ class RunLogWatcher:
             events = events_from_run(self.run_dir)
             self.db.insert_events(self.run_id, events)
             simulated = max_simulated_seconds_from_run(self.run_dir)
+            run = self.db.get_run(self.run_id)
+            if run:
+                stats = stats_from_run(self.run_dir, run.get("metadata", {}))
+                self.db.update_stats_snapshot(
+                    self.run_id,
+                    stats,
+                    warnings=stats.get("warnings", []),
+                )
         except FileNotFoundError:
             simulated = 0.0
         except Exception as exc:
