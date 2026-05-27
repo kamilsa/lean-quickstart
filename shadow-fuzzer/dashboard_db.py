@@ -632,23 +632,60 @@ class DashboardDB:
                 """,
                 (run_id, slot),
             ).fetchall()
-        blocks: dict[str, dict[str, Any]] = {}
-        for row in rows:
-            event = self._row_to_event(row)
+
+        events = [self._row_to_event(row) for row in rows]
+        hashes = sorted(
+            {
+                str(event["payload"].get("block_hash"))
+                for event in events
+                if event["payload"].get("block_hash")
+            }
+        )
+        proposers = sorted(
+            {
+                int(event["payload"].get("proposer"))
+                for event in events
+                if event["payload"].get("proposer") is not None
+            }
+        )
+
+        def _event_block_key(event: dict[str, Any]) -> str:
             payload = event["payload"]
             block_hash = payload.get("block_hash")
             proposer = payload.get("proposer")
-            key = str(block_hash or f"proposer:{proposer}" or f"slot:{slot}")
+            if len(hashes) == 1 and len(proposers) <= 1:
+                return f"hash:{hashes[0]}"
+            if len(hashes) == 0 and len(proposers) <= 1:
+                return f"proposer:{proposers[0]}" if proposers else f"slot:{slot}"
+            if block_hash:
+                return f"hash:{block_hash}"
+            if proposer is not None:
+                return f"proposer:{proposer}"
+            return f"slot:{slot}"
+
+        blocks: dict[str, dict[str, Any]] = {}
+        for event in events:
+            payload = event["payload"]
+            block_hash = payload.get("block_hash")
+            proposer = payload.get("proposer")
+            key = _event_block_key(event)
             blocks.setdefault(
                 key,
                 {
                     "block_id": key,
-                    "block_hash": block_hash,
-                    "proposer": proposer,
+                    "block_hash": block_hash
+                    or (hashes[0] if len(hashes) == 1 else None),
+                    "proposer": proposer
+                    if proposer is not None
+                    else (proposers[0] if len(proposers) == 1 else None),
                     "hosts": set(),
                     "events": 0,
                 },
             )
+            if block_hash and not blocks[key].get("block_hash"):
+                blocks[key]["block_hash"] = block_hash
+            if proposer is not None and blocks[key].get("proposer") is None:
+                blocks[key]["proposer"] = proposer
             if event.get("host"):
                 blocks[key]["hosts"].add(event["host"])
             blocks[key]["events"] += 1

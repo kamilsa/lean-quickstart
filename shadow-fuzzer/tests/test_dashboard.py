@@ -314,6 +314,42 @@ validators:
             self.assertEqual(detail["state"], "conflict")
             self.assertEqual(len(detail["blocks"]), 2)
 
+    def test_mixed_block_hash_and_proposer_events_do_not_create_false_conflict(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db = DashboardDB(root / "runs.db")
+            db.start_run(
+                "mixed-block-run",
+                root / "mixed-block-run",
+                _metadata("mixed-block-run"),
+            )
+            db.insert_events(
+                "mixed-block-run",
+                [
+                    {
+                        "kind": "block_received",
+                        "host": "qlean_0",
+                        "slot": 3,
+                        "ts_ms": 72000,
+                        "message": "qlean_0 received block",
+                        "payload": {"block_hash": "f117450cc2dd"},
+                    },
+                    {
+                        "kind": "block_received",
+                        "host": "zeam_0",
+                        "slot": 3,
+                        "ts_ms": 72125,
+                        "message": "zeam_0 received block",
+                        "payload": {"proposer": 1},
+                    },
+                ],
+            )
+
+            detail = db.get_slot_detail("mixed-block-run", 3)
+            self.assertEqual(detail["state"], "ok")
+            self.assertEqual(detail["block_count"], 1)
+            self.assertEqual(detail["slot_stats"]["n_received"], 2)
+
 
 class DashboardEventTests(unittest.TestCase):
     def test_event_parser_mappings_and_chain_deltas(self) -> None:

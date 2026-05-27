@@ -435,13 +435,15 @@ export default function App() {
                           <CartesianGrid stroke="#e5eaf3" />
                           <XAxis
                             dataKey="latency_ms"
+                            type="number"
+                            domain={[0, 'dataMax']}
                             tickFormatter={(value) => `${value}ms`}
                             tick={{ fontSize: 11 }}
                           />
                           <YAxis domain={[0, 100]} tickFormatter={(value) => `${value}%`} tick={{ fontSize: 11 }} />
                           <Tooltip formatter={(value) => `${value}%`} labelFormatter={(value) => `${value}ms`} />
                           <Line
-                            type="monotone"
+                            type="stepAfter"
                             dataKey="percent"
                             stroke="#2563eb"
                             strokeWidth={3}
