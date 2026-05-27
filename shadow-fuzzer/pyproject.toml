@@ -4,7 +4,9 @@ version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = [
     "coolname>=2.0",
+    "fastapi>=0.110",
     "pyyaml>=6.0",
+    "uvicorn[standard]>=0.27",
 ]
 
 [tool.uv]

@@ -8,10 +8,12 @@ simulations either locally or inside a Docker ARM container.
 Usage:
   python3 shadow-fuzzer.py [config.toml]
   python3 shadow-fuzzer.py --dry-run config.example.toml
+  python3 shadow-fuzzer.py --serve --host 127.0.0.1 --port 8000 config.toml
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import random
@@ -20,6 +22,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -620,13 +623,44 @@ def _validate_resolved(resolved: dict[str, Any]) -> list[str]:
     return warnings
 
 
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run randomized Shadow fuzzer sweeps")
+    parser.add_argument(
+        "config",
+        nargs="?",
+        default="config.example.toml",
+        help="Path to the fuzzer TOML config",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Generate run artifacts and metadata without running Shadow",
+    )
+    parser.add_argument(
+        "--serve",
+        action="store_true",
+        help="Start the live dashboard server alongside the fuzzer",
+    )
+    parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Dashboard bind host when --serve is enabled",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=8000,
+        help="Dashboard port when --serve is enabled",
+    )
+    return parser.parse_args()
+
+
 def main() -> None:
-    dry_run = "--dry-run" in sys.argv
-    args = [a for a in sys.argv[1:] if a != "--dry-run"]
-    config_path = args[0] if args else "config.example.toml"
-    config_path_abs = Path(config_path)
+    args = _parse_args()
+    dry_run = args.dry_run
+    config_path_abs = Path(args.config)
     if not config_path_abs.is_absolute():
-        config_path_abs = Path.cwd() / config_path
+        config_path_abs = Path.cwd() / config_path_abs
 
     if not config_path_abs.is_file():
         print(f"ERROR: config file not found: {config_path_abs}", file=sys.stderr)
@@ -653,6 +687,26 @@ def main() -> None:
     print(f"Fuzzer: max_runs={max_runs}, output_dir={output_dir}")
     print(f"Config: {config_path_abs}")
     print()
+
+    dashboard_db = None
+    if args.serve:
+        try:
+            from dashboard_db import DashboardDB
+            from dashboard_server import start_server_background
+
+            dashboard_db = DashboardDB(output_dir / "runs.db")
+            indexed = dashboard_db.reindex_output_dir(output_dir)
+            if indexed:
+                print(f"Indexed {indexed} existing dashboard run(s).")
+            start_server_background(output_dir, host=args.host, port=args.port)
+            print()
+        except ImportError as exc:
+            print(
+                "ERROR: --serve requires FastAPI and uvicorn. "
+                "Install requirements-fuzzer.txt first.",
+                file=sys.stderr,
+            )
+            raise exc
 
     docker_runtime = None
     if fuzzer.get("runner") == "docker-arm":
@@ -685,17 +739,6 @@ def main() -> None:
         print(f"  Node counts: {resolved['node_counts']}")
 
         internal = resolved.pop("_internal", {})
-
-        print("  Generating validator config...")
-        _write_validator_config(
-            run_dir,
-            internal["client_list"],
-            resolved["simulation"]["total_subnets"],
-            resolved["simulation"]["aggregators_per_subnet"],
-            internal["rng_state"],
-        )
-
-        print("  Writing run metadata...")
         metadata = {
             "run_id": run_id,
             "run_index": run_index,
@@ -707,58 +750,136 @@ def main() -> None:
         for key in ("docker_arm", "client_images", "client_runtime"):
             if key in resolved:
                 metadata[key] = resolved[key]
-        metadata_path = run_dir / "run-metadata.json"
-        metadata_path.write_text(json.dumps(metadata, indent=2))
-        print(f"  Wrote {metadata_path}")
 
-        generate_genesis = not dry_run
+        if dashboard_db:
+            dashboard_db.start_run(run_id, run_dir, metadata, warnings)
 
-        if generate_genesis:
-            print("  Generating genesis...")
-            _run_genesis(run_dir, str(fuzzer.get("base_genesis_dir", "shadow-devnet/genesis")))
+        current_stage = "preparing"
 
-        print("  Generating topology...")
-        _run_topology(run_dir, {**resolved, "_internal": internal})
+        def _set_stage(stage: str) -> None:
+            nonlocal current_stage
+            current_stage = stage
+            if dashboard_db:
+                dashboard_db.update_stage(run_id, stage)
 
-        print("  Generating shadow.yaml...")
-        _run_shadow_yaml(run_dir, {**resolved, "_internal": internal})
+        try:
+            print("  Generating validator config...")
+            _write_validator_config(
+                run_dir,
+                internal["client_list"],
+                resolved["simulation"]["total_subnets"],
+                resolved["simulation"]["aggregators_per_subnet"],
+                internal["rng_state"],
+            )
 
-        print("  Running Shadow...")
-        _run_shadow(run_dir, {**resolved, "_internal": internal}, dry_run=dry_run)
+            print("  Writing run metadata...")
+            metadata_path = run_dir / "run-metadata.json"
+            metadata_path.write_text(json.dumps(metadata, indent=2))
+            print(f"  Wrote {metadata_path}")
 
-        if not dry_run:
-            print("  Collecting stats...")
-            _run_stats(run_dir, metadata_path)
-        else:
-            print("  [dry-run] Writing metadata-only stats.json")
-            dry_stats = {
-                "blocks": {"slots": [], "summary": {"warning": "dry-run: no simulation data"}},
-                "chain_status": {"slots": [], "summary": {"warning": "dry-run: no simulation data"}},
-                "attestations": {
-                    "slots": [],
-                    "summary": {"warning": "dry-run: no simulation data"},
-                    "coverage": {
-                        "target_attestation_coverage": 0.95,
-                        "node_percentiles": [0.5, 0.9, 0.95],
+            generate_genesis = not dry_run
+
+            if generate_genesis:
+                _set_stage("generating_genesis")
+                print("  Generating genesis...")
+                _run_genesis(
+                    run_dir,
+                    str(fuzzer.get("base_genesis_dir", "shadow-devnet/genesis")),
+                )
+
+            _set_stage("generating_topology")
+            print("  Generating topology...")
+            _run_topology(run_dir, {**resolved, "_internal": internal})
+
+            _set_stage("generating_shadow_yaml")
+            print("  Generating shadow.yaml...")
+            _run_shadow_yaml(run_dir, {**resolved, "_internal": internal})
+
+            _set_stage("running_shadow")
+            print("  Running Shadow...")
+            watcher = None
+            if dashboard_db and not dry_run:
+                from dashboard_live import RunLogWatcher
+
+                watcher = RunLogWatcher(
+                    dashboard_db,
+                    run_id,
+                    run_dir,
+                    float(resolved["fuzzer"]["duration_secs"]),
+                )
+                watcher.start()
+            try:
+                _run_shadow(run_dir, {**resolved, "_internal": internal}, dry_run=dry_run)
+            finally:
+                if watcher:
+                    watcher.stop_and_join()
+
+            _set_stage("collecting_stats")
+            if not dry_run:
+                print("  Collecting stats...")
+                _run_stats(run_dir, metadata_path)
+            else:
+                print("  [dry-run] Writing metadata-only stats.json")
+                dry_stats = {
+                    "blocks": {
                         "slots": [],
                         "summary": {"warning": "dry-run: no simulation data"},
                     },
-                },
-                "node_distribution": {
-                    "clients": metadata["node_counts"],
-                    "regions": {},
-                    "bandwidths": {},
-                },
-                "warnings": ["dry-run"],
-            }
-            dry_stats.update(metadata)
-            (run_dir / "stats.json").write_text(json.dumps(dry_stats, indent=2))
-            print(f"  Wrote {run_dir / 'stats.json'}")
+                    "chain_status": {
+                        "slots": [],
+                        "summary": {"warning": "dry-run: no simulation data"},
+                    },
+                    "attestations": {
+                        "slots": [],
+                        "summary": {"warning": "dry-run: no simulation data"},
+                        "coverage": {
+                            "target_attestation_coverage": 0.95,
+                            "node_percentiles": [0.5, 0.9, 0.95],
+                            "slots": [],
+                            "summary": {"warning": "dry-run: no simulation data"},
+                        },
+                    },
+                    "node_distribution": {
+                        "clients": metadata["node_counts"],
+                        "regions": {},
+                        "bandwidths": {},
+                    },
+                    "warnings": ["dry-run"],
+                }
+                dry_stats.update(metadata)
+                (run_dir / "stats.json").write_text(json.dumps(dry_stats, indent=2))
+                print(f"  Wrote {run_dir / 'stats.json'}")
 
-        print(f"  Done → {run_dir}")
-        print()
+            stats = json.loads((run_dir / "stats.json").read_text())
+            all_warnings = [*warnings, *stats.get("warnings", [])]
+            final_status = "warning" if all_warnings else "complete"
+            if dashboard_db:
+                from dashboard_events import events_from_run
+
+                dashboard_db.insert_events(run_id, events_from_run(run_dir))
+                dashboard_db.finish_run(
+                    run_id,
+                    status=final_status,
+                    stats=stats,
+                    warnings=all_warnings,
+                )
+
+            print(f"  Done → {run_dir}")
+            print()
+        except Exception as exc:
+            if dashboard_db:
+                dashboard_db.update_stage(run_id, current_stage)
+                dashboard_db.fail_run(run_id, str(exc), warnings)
+            raise
 
     print(f"All {max_runs} runs complete.")
+    if args.serve:
+        print("Dashboard remains available; press Ctrl-C to stop.")
+        try:
+            while True:
+                time.sleep(3600)
+        except KeyboardInterrupt:
+            print("\nStopping dashboard.")
 
 
 if __name__ == "__main__":
