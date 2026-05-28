@@ -627,6 +627,40 @@ def _run_stats(run_dir: Path, metadata_path: Path) -> None:
     )
 
 
+def _write_stats_snapshot(
+    run_dir: Path,
+    metadata: dict[str, Any],
+    extra_warnings: list[str] | None = None,
+    *,
+    status: str | None = None,
+    error: str | None = None,
+) -> dict[str, Any]:
+    from dashboard_events import stats_from_run
+
+    stats = stats_from_run(run_dir, metadata)
+    warnings = list(dict.fromkeys([
+        *stats.get("warnings", []),
+        *(extra_warnings or []),
+    ]))
+    stats["warnings"] = warnings
+    if status is not None:
+        stats["status"] = status
+    if error is not None:
+        stats["error"] = error
+    (run_dir / "stats.json").write_text(json.dumps(stats, indent=2))
+    print(f"  Wrote {run_dir / 'stats.json'}")
+    return stats
+
+
+def _shadow_failure_message(exc: subprocess.CalledProcessError) -> str:
+    command = exc.cmd
+    if isinstance(command, (list, tuple)):
+        command_text = shlex.join(str(part) for part in command)
+    else:
+        command_text = str(command)
+    return f"Shadow exited with status {exc.returncode}: {command_text}"
+
+
 def _generate_run_id(run_index: int) -> str:
     try:
         import coolname
@@ -831,6 +865,7 @@ def main() -> None:
         docker_runtime = _prepare_docker_arm_runtime(template, output_dir, dry_run)
         print()
     hash_sig_key_cache_root = output_dir / HASH_SIG_KEY_CACHE_DIR
+    failed_runs = 0
 
     for run_index in range(int(max_runs)):
         print(f"--- Run {run_index + 1}/{max_runs} ---")
@@ -924,6 +959,7 @@ def main() -> None:
             _set_stage("running_shadow")
             print("  Running Shadow...")
             watcher = None
+            shadow_error = None
             if dashboard_db and not dry_run:
                 from dashboard_live import RunLogWatcher
 
@@ -935,7 +971,11 @@ def main() -> None:
                 )
                 watcher.start()
             try:
-                _run_shadow(run_dir, {**resolved, "_internal": internal}, dry_run=dry_run)
+                try:
+                    _run_shadow(run_dir, {**resolved, "_internal": internal}, dry_run=dry_run)
+                except subprocess.CalledProcessError as exc:
+                    shadow_error = _shadow_failure_message(exc)
+                    print(f"  ERROR: {shadow_error}")
             finally:
                 if watcher:
                     watcher.stop_and_join()
@@ -943,21 +983,33 @@ def main() -> None:
             _set_stage("collecting_stats")
             if not dry_run:
                 print("  Collecting stats...")
-                _run_stats(run_dir, metadata_path)
+                try:
+                    _run_stats(run_dir, metadata_path)
+                except subprocess.CalledProcessError:
+                    if shadow_error is None:
+                        raise
+                    print("  Stats command failed; writing snapshot from partial logs.")
+                    _write_stats_snapshot(
+                        run_dir,
+                        metadata,
+                        [shadow_error],
+                        status="error",
+                        error=shadow_error,
+                    )
             else:
                 print("  [dry-run] Writing metadata-only stats.json")
-                from dashboard_events import stats_from_run
-
-                dry_stats = stats_from_run(run_dir, metadata)
-                dry_stats["warnings"] = list(
-                    dict.fromkeys(["dry-run", *dry_stats.get("warnings", [])])
-                )
-                (run_dir / "stats.json").write_text(json.dumps(dry_stats, indent=2))
-                print(f"  Wrote {run_dir / 'stats.json'}")
+                _write_stats_snapshot(run_dir, metadata, ["dry-run"])
 
             stats = json.loads((run_dir / "stats.json").read_text())
+            if shadow_error is not None:
+                stats["status"] = "error"
+                stats["error"] = shadow_error
+                stats["warnings"] = list(
+                    dict.fromkeys([*stats.get("warnings", []), shadow_error])
+                )
+                (run_dir / "stats.json").write_text(json.dumps(stats, indent=2))
             all_warnings = [*warnings, *stats.get("warnings", [])]
-            final_status = "warning" if all_warnings else "complete"
+            final_status = "error" if shadow_error else ("warning" if all_warnings else "complete")
             if dashboard_db:
                 from dashboard_events import events_from_run
 
@@ -968,8 +1020,14 @@ def main() -> None:
                     stats=stats,
                     warnings=all_warnings,
                 )
+                if shadow_error is not None:
+                    dashboard_db.fail_run(run_id, shadow_error, all_warnings)
 
-            print(f"  Done → {run_dir}")
+            if shadow_error is not None:
+                failed_runs += 1
+                print(f"  Recorded failed Shadow run → {run_dir}")
+            else:
+                print(f"  Done → {run_dir}")
             print()
         except Exception as exc:
             if dashboard_db:
@@ -977,7 +1035,10 @@ def main() -> None:
                 dashboard_db.fail_run(run_id, str(exc), warnings)
             raise
 
-    print(f"All {max_runs} runs complete.")
+    if failed_runs:
+        print(f"Finished {max_runs} run(s) with {failed_runs} Shadow error(s).")
+    else:
+        print(f"All {max_runs} runs complete.")
     if args.serve:
         print("Dashboard remains available; press Ctrl-C to stop.")
         try:
@@ -985,6 +1046,8 @@ def main() -> None:
                 time.sleep(3600)
         except KeyboardInterrupt:
             print("\nStopping dashboard.")
+    elif failed_runs:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

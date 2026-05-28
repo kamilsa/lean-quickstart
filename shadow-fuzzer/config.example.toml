@@ -3,7 +3,7 @@
 # Ranges are resolved per-run using `seed + run_index`.
 
 [fuzzer]
-max_runs = 20                                                              # Total number of simulation runs in the sweep.
+max_runs = 200                                                              # Total number of simulation runs in the sweep.
 duration_secs = { min = 120, max = 120 }                                   # Duration of a single Shadow simulation in seconds (range or scalar).
 seed = 42                                                                  # Base seed — per-run seed is `seed + run_index` for reproducibility.
 output_dir = "fuzzer-output"                                               # Directory where per-run output folders are placed.
@@ -26,7 +26,7 @@ executable = "qlean"                                                         # C
 # executable_path_in_image = "/usr/local/bin/qlean"                           # Optional explicit executable path inside the source image.
 
 [simulation]
-total_nodes = { min = 16, max = 32 }                                      # Total number of validator nodes in the network.
+total_nodes = { min = 32, max = 64 }                                      # Total number of validator nodes in the network.
 total_subnets = { min = 1, max = 1 }                                       # Number of attestation subnets (attestation_committee_count).
 aggregators_per_subnet = { min = 1, max = 2 }                              # How many aggregator nodes to select per subnet.
 signatures_aggregation_rate = { min = 1000, max = 1000 }                   # qlean fake XMSS aggregate-signatures rate (sig/s). Placeholder for zeam.

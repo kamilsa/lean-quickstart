@@ -848,12 +848,16 @@ class DashboardDB:
         existing = self.get_run(run_id)
         if existing and not overwrite:
             if stats and not existing.get("stats"):
+                status = _status_from_stats(stats)
+                warnings = stats.get("warnings", [])
                 self.finish_run(
                     run_id,
-                    status="warning" if stats.get("warnings") else "complete",
+                    status=status,
                     stats=stats,
-                    warnings=stats.get("warnings", []),
+                    warnings=warnings,
                 )
+                if status == "error" and stats.get("error"):
+                    self.fail_run(run_id, str(stats["error"]), warnings)
             return False
 
         if not metadata:
@@ -867,8 +871,16 @@ class DashboardDB:
             }
         self.start_run(run_id, run_path, metadata, stats.get("warnings", []))
         if stats:
-            status = "warning" if stats.get("warnings") else "complete"
-            self.finish_run(run_id, status=status, stats=stats, warnings=stats.get("warnings", []))
+            status = _status_from_stats(stats)
+            warnings = stats.get("warnings", [])
+            self.finish_run(
+                run_id,
+                status=status,
+                stats=stats,
+                warnings=warnings,
+            )
+            if status == "error" and stats.get("error"):
+                self.fail_run(run_id, str(stats["error"]), warnings)
         self.insert_events(run_id, events_from_run(run_path))
         return True
 
@@ -890,6 +902,13 @@ def _load_json(path: Path) -> dict[str, Any]:
         return json.loads(path.read_text())
     except json.JSONDecodeError:
         return {}
+
+
+def _status_from_stats(stats: dict[str, Any]) -> str:
+    status = stats.get("status")
+    if status in {"complete", "warning", "error"}:
+        return str(status)
+    return "warning" if stats.get("warnings") else "complete"
 
 
 def _percentile(values: list[float], percentile: float) -> float | None:

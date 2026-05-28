@@ -5,6 +5,7 @@ import io
 import json
 import importlib.util
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -270,6 +271,28 @@ validators:
             self.assertEqual([path.name for path in root.iterdir()], [shadow_fuzzer_script.HASH_SIG_KEY_CACHE_DIR])
             self.assertTrue((cache_dir / "validator_0_pk.ssz").is_file())
 
+    def test_failed_shadow_stats_snapshot_records_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            error = "Shadow exited with status 1"
+            with contextlib.redirect_stdout(io.StringIO()):
+                stats = shadow_fuzzer_script._write_stats_snapshot(
+                    run_dir,
+                    _metadata("failed-shadow-run"),
+                    [error],
+                    status="error",
+                    error=error,
+                )
+
+            written = json.loads((run_dir / "stats.json").read_text())
+            self.assertEqual(stats["status"], "error")
+            self.assertEqual(written["error"], error)
+            self.assertIn(error, written["warnings"])
+
+    def test_shadow_failure_message_includes_returncode(self) -> None:
+        exc = subprocess.CalledProcessError(7, ["shadow", "-d", "out", "shadow.yaml"])
+        self.assertIn("status 7", shadow_fuzzer_script._shadow_failure_message(exc))
+
     def test_reindex_existing_output_dir(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -282,6 +305,24 @@ validators:
             self.assertEqual(db.reindex_output_dir(root), 1)
             self.assertEqual(db.get_stats()["total_runs"], 1)
             self.assertEqual(db.get_chain("silver-quiet-lotus")["peers"][0]["peer"], "qlean_0")
+
+    def test_reindex_preserves_error_status_from_stats(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run_dir = root / "failed-shadow-run"
+            run_dir.mkdir()
+            stats = _stats("failed-shadow-run")
+            stats["status"] = "error"
+            stats["error"] = "Shadow exited with status 1"
+            stats["warnings"] = [stats["error"]]
+            (run_dir / "run-metadata.json").write_text(json.dumps(_metadata("failed-shadow-run")))
+            (run_dir / "stats.json").write_text(json.dumps(stats))
+
+            db = DashboardDB(root / "runs.db")
+            self.assertEqual(db.reindex_output_dir(root), 1)
+            run = db.get_run("failed-shadow-run")
+            self.assertEqual(run["status"], "error")
+            self.assertEqual(run["error"], stats["error"])
 
     def test_slot_conflict_detection(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
