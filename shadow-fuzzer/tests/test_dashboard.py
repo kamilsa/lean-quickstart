@@ -333,6 +333,48 @@ validators:
             self.assertEqual(db.get_stats()["total_runs"], 1)
             self.assertEqual(db.get_chain("silver-quiet-lotus")["peers"][0]["peer"], "qlean_0")
 
+    def test_chain_view_can_select_historical_slot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            stats = _stats()
+            stats["chain_status"]["slots"].append({
+                "slot": 14,
+                "hosts": {
+                    "qlean_0": {
+                        "head_slot": 14,
+                        "head_root": "new",
+                        "latest_justified_slot": 12,
+                        "latest_justified_root": "new-justified",
+                        "latest_finalized_slot": 11,
+                        "latest_finalized_root": "new-finalized",
+                        "ts_ms": 56000.0,
+                    },
+                    "zeam_0": {
+                        "head_slot": 14,
+                        "head_root": "zeam-new",
+                        "latest_justified_slot": 12,
+                        "latest_justified_root": "zeam-justified",
+                        "latest_finalized_slot": 11,
+                        "latest_finalized_root": "zeam-finalized",
+                        "ts_ms": 56100.0,
+                    },
+                },
+            })
+            run_dir = root / "silver-quiet-lotus"
+            db = DashboardDB(root / "runs.db")
+            db.start_run("silver-quiet-lotus", run_dir, _metadata())
+            db.finish_run("silver-quiet-lotus", status="complete", stats=stats)
+
+            historical = db.get_chain("silver-quiet-lotus", slot=12)
+            latest = db.get_chain("silver-quiet-lotus")
+
+            self.assertEqual(historical["selected_slot"], 12)
+            self.assertEqual(historical["slots"], [12, 14])
+            self.assertEqual(historical["peers"][0]["head_slot"], 12)
+            self.assertEqual(latest["selected_slot"], 14)
+            self.assertEqual(latest["peers"][0]["head_slot"], 14)
+            self.assertEqual(latest["peers"][0]["justified_slot"], 12)
+
     def test_reindex_preserves_error_status_from_stats(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

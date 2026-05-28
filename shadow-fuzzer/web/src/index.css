@@ -618,6 +618,54 @@ pre {
   gap: 10px;
 }
 
+.chain-slot-selector {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid #dbe4f0;
+  border-radius: 8px;
+  background: #f8fbff;
+}
+
+.selector-head,
+.chain-slot-labels {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.selector-head span,
+.chain-slot-labels span {
+  color: #64748b;
+  font-weight: 850;
+}
+
+.selector-head strong {
+  color: #2563eb;
+  font-size: 18px;
+}
+
+.chain-slot-selector input {
+  width: 100%;
+  accent-color: #2563eb;
+}
+
+.chain-slot-labels {
+  font-size: 12px;
+}
+
+.chain-latest-button {
+  justify-self: start;
+  min-height: 30px;
+  padding: 0 10px;
+  border: 1px solid #bfdbfe;
+  border-radius: 8px;
+  background: #eff6ff;
+  color: #2563eb;
+  font-weight: 850;
+}
+
 .donut-row {
   display: grid;
   grid-template-columns: 140px minmax(0, 1fr);

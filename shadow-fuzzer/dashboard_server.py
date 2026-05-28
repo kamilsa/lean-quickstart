@@ -196,8 +196,8 @@ def create_app(
         )
 
     @app.get("/api/run/{run_id}/chain")
-    async def get_chain(run_id: str) -> dict[str, Any]:
-        chain = db.get_chain(run_id)
+    async def get_chain(run_id: str, slot: int | None = None) -> dict[str, Any]:
+        chain = db.get_chain(run_id, slot=slot)
         if chain is None:
             raise HTTPException(status_code=404, detail="Run not found")
         return chain

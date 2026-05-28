@@ -827,13 +827,17 @@ class DashboardDB:
             block_slot["published_ms"] = published_ms
         return block_slot
 
-    def get_chain(self, run_id: str) -> dict[str, Any] | None:
+    def get_chain(self, run_id: str, slot: int | None = None) -> dict[str, Any] | None:
         run = self.get_run(run_id)
         if not run:
             return None
         latest: dict[str, dict[str, Any]] = {}
+        slots: list[int] = []
         for slot_entry in run["stats"].get("chain_status", {}).get("slots", []):
             chain_slot = int(slot_entry.get("slot", 0))
+            slots.append(chain_slot)
+            if slot is not None and chain_slot > slot:
+                continue
             for host, status in slot_entry.get("hosts", {}).items():
                 previous = latest.get(host)
                 if previous is None or chain_slot >= previous["reported_slot"]:
@@ -849,7 +853,16 @@ class DashboardDB:
                         "ts_ms": status.get("ts_ms"),
                         "source": status.get("source"),
                     }
-        return {"run_id": run_id, "peers": [latest[k] for k in sorted(latest)]}
+        unique_slots = sorted(set(slots))
+        selected_slot = slot
+        if selected_slot is None and unique_slots:
+            selected_slot = unique_slots[-1]
+        return {
+            "run_id": run_id,
+            "selected_slot": selected_slot,
+            "slots": unique_slots,
+            "peers": [latest[k] for k in sorted(latest)],
+        }
 
     def index_run_dir(self, run_dir: str | Path, *, overwrite: bool = False) -> bool:
         run_path = Path(run_dir)

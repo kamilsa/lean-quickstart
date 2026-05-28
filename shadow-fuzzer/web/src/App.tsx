@@ -108,11 +108,18 @@ interface EventRow {
 interface ChainPeer {
   peer: string
   reported_slot: number
-  head_slot: number
-  justified_slot: number
-  finalized_slot: number
+  head_slot?: number | null
+  justified_slot?: number | null
+  finalized_slot?: number | null
   ts_ms?: number
   source?: string
+}
+
+interface ChainResponse {
+  run_id: string
+  selected_slot: number | null
+  slots: number[]
+  peers: ChainPeer[]
 }
 
 interface CoverageDatum {
@@ -187,6 +194,9 @@ export default function App() {
   const [events, setEvents] = useState<EventRow[]>([])
   const [eventKind, setEventKind] = useState('all')
   const [chain, setChain] = useState<ChainPeer[]>([])
+  const [chainSlots, setChainSlots] = useState<number[]>([])
+  const [selectedChainSlot, setSelectedChainSlot] = useState<number | null>(null)
+  const [displayedChainSlot, setDisplayedChainSlot] = useState<number | null>(null)
   const [drawerTab, setDrawerTab] = useState<'overview' | 'prop' | 'chain' | 'config' | 'files'>(
     'overview'
   )
@@ -222,13 +232,11 @@ export default function App() {
     if (!selectedRunId) return
     Promise.all([
       api<RunDetail>(`/api/run/${selectedRunId}`),
-      api<{ slots: SlotSummary[] }>(`/api/run/${selectedRunId}/slots`),
-      api<{ peers: ChainPeer[] }>(`/api/run/${selectedRunId}/chain`)
+      api<{ slots: SlotSummary[] }>(`/api/run/${selectedRunId}/slots`)
     ])
-      .then(([runData, slotData, chainData]) => {
+      .then(([runData, slotData]) => {
         setRun(runData)
         setSlots(slotData.slots)
-        setChain(chainData.peers)
         const currentSlot = runData.current_slot
         const blockSlot = slotData.slots.find(
           (slot) => (slot.block_count ?? 0) > 0 || (slot.n_received ?? 0) > 0
@@ -244,10 +252,42 @@ export default function App() {
             ? previous
             : nextSlot
         )
-        setNodeDownload((existing) => existing || chainData.peers[0]?.peer || '')
       })
       .catch(console.error)
   }, [selectedRunId, refreshToken])
+
+  useEffect(() => {
+    setChain([])
+    setChainSlots([])
+    setSelectedChainSlot(null)
+    setDisplayedChainSlot(null)
+  }, [selectedRunId])
+
+  useEffect(() => {
+    if (!selectedRunId) return
+    const params = new URLSearchParams()
+    if (selectedChainSlot != null) params.set('slot', String(selectedChainSlot))
+    const suffix = params.size ? `?${params.toString()}` : ''
+    api<ChainResponse>(`/api/run/${selectedRunId}/chain${suffix}`)
+      .then((chainData) => {
+        setChain(chainData.peers)
+        setChainSlots(chainData.slots)
+        setDisplayedChainSlot(chainData.selected_slot)
+        setSelectedChainSlot((previous) => {
+          if (!chainData.slots.length) return null
+          const minSlot = Math.min(...chainData.slots)
+          const maxSlot = Math.max(...chainData.slots)
+          if (previous != null && previous >= minSlot && previous <= maxSlot) return previous
+          return null
+        })
+        setNodeDownload((existing) => existing || chainData.peers[0]?.peer || '')
+      })
+      .catch(() => {
+        setChain([])
+        setChainSlots([])
+        setDisplayedChainSlot(null)
+      })
+  }, [selectedRunId, selectedChainSlot, refreshToken])
 
   useEffect(() => {
     if (!selectedRunId) return
@@ -283,6 +323,9 @@ export default function App() {
   const bandwidthCounts = objectEntries(run?.stats?.node_distribution?.bandwidths)
   const duration = selectedSummary?.duration_secs ?? run?.metadata?.fuzzer?.duration_secs ?? 0
   const maxSlot = Math.max(maxChainSlotForDuration(duration), selectedSummary?.current_slot ?? 0, 0)
+  const chainSlotMin = chainSlots.length ? Math.min(...chainSlots) : 0
+  const chainSlotMax = chainSlots.length ? Math.max(...chainSlots) : 0
+  const chainSlotValue = displayedChainSlot ?? chainSlotMax
 
   return (
     <div className="app-shell">
@@ -626,6 +669,31 @@ export default function App() {
             )}
             {drawerTab === 'chain' && (
               <div className="drawer-pane">
+                {chainSlots.length ? (
+                  <div className="chain-slot-selector">
+                    <div className="selector-head">
+                      <span>Chain status at slot</span>
+                      <strong>{selectedChainSlot == null ? 'latest' : `slot ${chainSlotValue}`}</strong>
+                    </div>
+                    <input
+                      type="range"
+                      min={chainSlotMin}
+                      max={chainSlotMax}
+                      value={chainSlotValue}
+                      onChange={(event) => setSelectedChainSlot(Number(event.target.value))}
+                    />
+                    <div className="chain-slot-labels">
+                      <span>slot {chainSlotMin}</span>
+                      <span>{chain.length ? `${chain.length} peers reported` : 'no peer reports yet'}</span>
+                      <span>slot {chainSlotMax}</span>
+                    </div>
+                    {selectedChainSlot != null ? (
+                      <button className="chain-latest-button" onClick={() => setSelectedChainSlot(null)}>
+                        Follow latest
+                      </button>
+                    ) : null}
+                  </div>
+                ) : null}
                 <div className="peer-table">
                   <div className="peer-row header">
                     <span>Peer</span>
@@ -643,7 +711,7 @@ export default function App() {
                       </div>
                     ))
                   ) : (
-                    <EmptyState message="Chain status rows appear once peers log chain status." />
+                    <EmptyState message="No chain status rows are available at this slot yet." />
                   )}
                 </div>
               </div>
