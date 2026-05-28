@@ -115,6 +115,12 @@ interface ChainPeer {
   source?: string
 }
 
+interface CoverageDatum {
+  slot: string
+  ms: number
+  warning: boolean
+}
+
 const EVENT_KINDS = [
   ['all', 'All events'],
   ['attestation_sent', 'Attestation sent'],
@@ -261,13 +267,16 @@ export default function App() {
 
   const selectedSummary = runs.find((item) => item.run_id === selectedRunId) ?? run
   const progress = selectedSummary?.progress ?? 0
-  const coverageData = useMemo<Array<{ slot: string; p95: number; warning: boolean }>>(() => {
+  const coverageData = useMemo<CoverageDatum[]>(() => {
     const coverageSlots = run?.stats?.attestations?.coverage?.slots ?? []
-    return coverageSlots.slice(0, 24).map((slot: any) => ({
-      slot: `s${slot.slot}`,
-      p95: slot.p95_nodes_to_95_attestations_ms ?? 0,
-      warning: Boolean(slot.warning)
-    }))
+    return coverageSlots
+      .slice(0, 24)
+      .map((slot: any) => ({
+        slot: `s${slot.slot}`,
+        ms: slot.p95_nodes_to_95_attestations_ms ?? slot.max_nodes_to_95_attestations_ms,
+        warning: Boolean(slot.warning)
+      }))
+      .filter((slot: CoverageDatum) => slot.ms != null)
   }, [run])
   const nodeCounts = objectEntries(run?.stats?.node_distribution?.clients)
   const regionCounts = objectEntries(run?.stats?.node_distribution?.regions)
@@ -491,7 +500,7 @@ export default function App() {
           </section>
 
           <section className="card card-pad">
-            <SectionTitle title="Attestation Coverage By Slot" subtitle="p95 nodes reaching 95% published attestations" />
+            <SectionTitle title="Attestation Coverage By Slot" subtitle="p95, or max reached when p95 is unavailable" />
             {coverageData.length ? (
               <div className="chart-box short">
                 <ResponsiveContainer width="100%" height={230}>
@@ -500,9 +509,9 @@ export default function App() {
                     <XAxis dataKey="slot" tick={{ fontSize: 11 }} />
                     <YAxis tick={{ fontSize: 11 }} />
                     <Tooltip formatter={(value) => `${value}ms`} />
-                    <Bar dataKey="p95" radius={[4, 4, 0, 0]}>
+                    <Bar dataKey="ms" radius={[4, 4, 0, 0]}>
                       {coverageData.map((entry, index) => (
-                        <Cell key={entry.slot} fill={entry.warning ? '#f59e0b' : COLORS[index % COLORS.length]} />
+                        <Cell key={entry.slot} fill={COLORS[index % COLORS.length]} />
                       ))}
                     </Bar>
                   </BarChart>

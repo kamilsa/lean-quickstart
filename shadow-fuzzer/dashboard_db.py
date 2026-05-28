@@ -15,6 +15,10 @@ from dashboard_time import chain_slot_from_simulated_seconds
 
 
 TERMINAL_STATUSES = {"complete", "warning", "error"}
+TRANSIENT_STATS_WARNING_PREFIXES = (
+    "shadow.data/hosts directory not found",
+    "No propagation events found",
+)
 
 
 SCHEMA = """
@@ -80,6 +84,13 @@ def _json_loads(value: str | None, fallback: Any) -> Any:
         return json.loads(value)
     except json.JSONDecodeError:
         return fallback
+
+
+def _is_transient_stats_warning(warning: str) -> bool:
+    return any(
+        warning.startswith(prefix)
+        for prefix in TRANSIENT_STATS_WARNING_PREFIXES
+    )
 
 
 def _metadata_run_index(metadata: dict[str, Any]) -> int | None:
@@ -363,7 +374,11 @@ class DashboardDB:
             if not existing:
                 return
             merged_warnings = list(dict.fromkeys([
-                *_json_loads(existing["warnings"], []),
+                *[
+                    warning
+                    for warning in _json_loads(existing["warnings"], [])
+                    if not _is_transient_stats_warning(str(warning))
+                ],
                 *(warnings if warnings is not None else stats.get("warnings", [])),
             ]))
             conn.execute(

@@ -202,6 +202,33 @@ class DashboardDBTests(unittest.TestCase):
             self.assertEqual(detail["slot_stats"]["n_received"], 2)
             self.assertEqual(detail["cdf"][-1]["latency_ms"], 300.0)
 
+    def test_stats_snapshot_clears_transient_parser_warnings(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db = DashboardDB(root / "runs.db")
+            db.start_run(
+                "live-run",
+                root / "live-run",
+                _metadata("live-run"),
+                ["total_subnets (2) > total_nodes (1)"],
+            )
+            db.update_stats_snapshot(
+                "live-run",
+                {
+                    **_stats("live-run"),
+                    "warnings": [
+                        "shadow.data/hosts directory not found; no propagation stats available",
+                        "No propagation events found in any host stdout/stderr",
+                    ],
+                },
+            )
+            db.update_stats_snapshot("live-run", {**_stats("live-run"), "warnings": []})
+
+            self.assertEqual(
+                db.get_run("live-run")["warnings"],
+                ["total_subnets (2) > total_nodes (1)"],
+            )
+
     def test_hash_sig_key_cache_helpers_use_validator_count_and_active_epoch(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
